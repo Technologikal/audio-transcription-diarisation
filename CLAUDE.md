@@ -27,7 +27,38 @@ Audio Input → FFmpeg (chunk to 10min WAV segments, 16kHz mono)
 
 ## Setup and Dependencies
 
+### Repository Information
+
+**GitHub Repository**: https://github.com/Technologikal/audio-transcription-diarisation
+
+This project is version-controlled with Git and hosted on GitHub (private repository). This enables:
+- Multi-machine development
+- Version history tracking
+- Collaboration capabilities
+- Automatic backup
+
 ### Initial Setup
+
+**Option 1: Clone from GitHub (Recommended)**
+
+```bash
+# Clone the repository
+git clone https://github.com/Technologikal/audio-transcription-diarisation.git
+cd audio-transcription-diarisation/transcription_project
+
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure authentication
+cp .env.example .env
+# Edit .env and add your HF_TOKEN
+```
+
+**Option 2: Local Setup (if already have the files)**
 
 ```bash
 cd transcription_project
@@ -323,6 +354,123 @@ python3 transcribe.py meeting.m4a --language None
 
 The `transcription_project/audio/LibriSpeech/` directory contains the dev-clean dataset for testing with known multi-speaker samples.
 
+**Note**: The original `dev-clean.tar.gz` archive (322 MB) is not tracked in Git due to GitHub's 100 MB file size limit. Only the extracted files are included in the repository.
+
+## Git Workflow and Multi-Machine Development
+
+This project is hosted on GitHub and follows standard Git workflows for version control and multi-machine development.
+
+### Basic Git Workflow
+
+```bash
+# Check current status
+git status
+
+# Stage changes
+git add .
+
+# Commit with descriptive message
+git commit -m "Brief description of changes"
+
+# Push to GitHub
+git push
+
+# Pull latest changes (on another machine)
+git pull
+```
+
+### Multi-Machine Development
+
+**Setting up on a new machine:**
+
+```bash
+# 1. Clone repository
+git clone https://github.com/Technologikal/audio-transcription-diarisation.git
+cd audio-transcription-diarisation/transcription_project
+
+# 2. Set up environment
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Configure authentication (not tracked in Git)
+cp .env.example .env
+# Edit .env and add your HF_TOKEN
+
+# 4. Ready to work!
+python3 transcribe.py --help
+```
+
+**Syncing changes between machines:**
+
+```bash
+# Before starting work (pull latest changes)
+git pull
+
+# After making changes (push to GitHub)
+git add .
+git commit -m "Description of what changed"
+git push
+
+# On other machine (get updates)
+git pull
+```
+
+### Git Configuration
+
+**User Identity** (one-time setup):
+```bash
+git config --global user.name "Your Name"
+git config --global user.email "your@email.com"
+```
+
+**GitHub Authentication**:
+- Uses GitHub CLI (`gh`) for authentication
+- Run `gh auth login` once per machine
+- Credentials stored securely by GitHub CLI
+
+### Important Git Conventions
+
+**Files NOT tracked in Git** (via `.gitignore`):
+- `.env` (contains secrets)
+- `venv/` (virtual environment)
+- `*.m4a`, `*.wav`, `*.mp3`, `*.flac` (audio files)
+- `*.tar.gz`, `*.zip` (large archives)
+- `temp_chunk_*.wav` (temporary processing files)
+- `*_transcription.txt` (output files)
+- `*.doc`, `*.docx`, `*.pdf` (documents)
+
+**Files tracked in Git**:
+- Source code (`.py` files)
+- Documentation (`.md` files)
+- Configuration templates (`.env.example`)
+- Requirements (`requirements.txt`)
+- Sample data (LibriSpeech extracted text files only)
+
+### Branch Strategy
+
+**Current**: Single `main` branch (simple workflow for solo development)
+
+**For collaboration** (future consideration):
+- `main` - stable production code
+- `feature/feature-name` - new features
+- `bugfix/issue-description` - bug fixes
+
+### Commit Message Guidelines
+
+Use clear, descriptive commit messages:
+
+```bash
+# Good examples
+git commit -m "Add batch processing support for multiple audio files"
+git commit -m "Fix memory leak in chunk processing"
+git commit -m "Update documentation for new --auto-adjust flag"
+
+# Avoid vague messages
+git commit -m "fix stuff"
+git commit -m "updates"
+```
+
 ## Current Limitations
 
 1. **Single File Processing**: No batch processing support - must run script multiple times for multiple files
@@ -334,8 +482,10 @@ The `transcription_project/audio/LibriSpeech/` directory contains the dev-clean 
 
 ## Development Conventions
 
+- **Version Control**: Git for version control, GitHub for hosting (private repository)
 - **Virtual Environment**: All dependencies managed within `transcription_project/venv/`
 - **Code Style**: Standard Python (PEP 8) - no configured linters/formatters
+- **Spelling**: UK English throughout codebase (e.g., "diarisation" not "diarization")
 - **Logging**: Uses Python `logging` module with configurable verbosity (INFO/DEBUG levels)
 - **Error Handling**: Comprehensive try/except blocks with meaningful error messages
 - **Argument Parsing**: Uses `argparse` for CLI interface with help documentation
@@ -345,6 +495,7 @@ The `transcription_project/audio/LibriSpeech/` directory contains the dev-clean 
 - **Memory Management**: Large files processed in chunks; entire chunks read into memory to avoid seeking issues
 - **Resource Monitoring**: Pre-flight memory checks using `psutil` to prevent OOM crashes
 - **Resource Cleanup**: `try/finally` blocks ensure temporary files are cleaned up
+- **Multi-Machine Support**: Repository designed for seamless development across multiple machines
 
 ## Recent Improvements
 
@@ -355,6 +506,13 @@ The following improvements were made to the codebase (October 2025):
 - Fixed audio file seeking bug - changed to read entire chunk into memory for reliable slicing
 - Maintained PyAnnote API compatibility with v4.0.1 - uses `.speaker_diarisation.itertracks()`
 - Added automatic resource checking to prevent OOM (out-of-memory) crashes
+
+**Infrastructure Enhancements**:
+- Set up Git version control with GitHub hosting (private repository)
+- Implemented multi-machine development workflow
+- Standardised UK English spelling throughout codebase
+- Configured comprehensive `.gitignore` for security and file management
+- Removed large files (>100 MB) to comply with GitHub limits
 
 **Security Enhancements**:
 - Implemented secure `.env` file storage for HF_TOKEN using `python-dotenv`
