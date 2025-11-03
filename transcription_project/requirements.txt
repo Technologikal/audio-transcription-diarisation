@@ -6,3 +6,4 @@ soundfile
 numpy
 python-dotenv
 psutil
+python-docx
