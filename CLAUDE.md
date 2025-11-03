@@ -365,6 +365,80 @@ The agenda feature requires the `python-docx` library for parsing DOCX files. Th
 pip install -r requirements.txt
 ```
 
+### Gradio Web GUI (EXPERIMENTAL)
+
+⚠️ **Status: Proof-of-Concept / Prototype**
+
+An experimental web-based GUI is available for testing and demos. **This is NOT recommended for production use** due to known limitations.
+
+**Files:**
+- `transcription_project/gradio_app.py` - Full-featured web interface
+- `transcription_project/gradio_simple.py` - Minimal test interface
+
+**Launch the GUI:**
+
+```bash
+# Activate environment
+source transcription_project/venv/bin/activate
+
+# Launch web interface
+python3 gradio_app.py
+
+# Opens browser to http://localhost:7860
+```
+
+**Features:**
+- 🎤 Audio file upload with drag-and-drop
+- 📄 Optional agenda document upload
+- 🎛️ Model selection and configuration
+- 💻 Real-time system resource monitoring
+- 📊 Tabbed results viewer (Transcript / Summary)
+
+**Known Limitations:**
+
+1. **Browser Timeout for Long Files** ⚠️
+   - The GUI runs transcription synchronously
+   - For audio files > 10-30 minutes, the browser will timeout after 2-5 minutes
+   - The page freezes during processing and may crash
+   - **Workaround**: Use GUI only for short test clips (< 10 minutes)
+   - **Production**: Use CLI for real meeting recordings
+   - **Tracked in**: [Issue #7](https://github.com/Technologikal/audio-transcription-diarisation/issues/7)
+
+2. **Table-Based Agendas Not Supported** ⚠️
+   - The agenda parser only reads paragraphs, not tables
+   - Many real agendas use table layouts (columns for speakers, topics, etc.)
+   - Results in 0 speakers found, no name mapping
+   - **Tracked in**: [Issue #2](https://github.com/Technologikal/audio-transcription-diarisation/issues/2)
+
+**When to Use GUI:**
+- ✅ Testing with short audio clips (< 10 minutes)
+- ✅ Experimenting with different models/settings
+- ✅ Demos and quick trials
+- ✅ Learning the interface
+
+**When to Use CLI:**
+- ✅ **Production transcription** of meeting recordings
+- ✅ Long audio files (> 10 minutes)
+- ✅ Batch processing
+- ✅ Reliable, non-interactive processing
+
+**Future Improvements:**
+
+See GitHub issues for planned enhancements:
+- [Issue #7](https://github.com/Technologikal/audio-transcription-diarisation/issues/7) - Background task processing
+- [Issue #3](https://github.com/Technologikal/audio-transcription-diarisation/issues/3) - Full Gradio implementation
+- [Issue #4](https://github.com/Technologikal/audio-transcription-diarisation/issues/4) - NiceGUI alternative
+- [Issue #5](https://github.com/Technologikal/audio-transcription-diarisation/issues/5) - PyQt6 desktop app
+- [Issue #6](https://github.com/Technologikal/audio-transcription-diarisation/issues/6) - Streamlit dashboard
+
+**Lessons Learned:**
+
+1. **Synchronous vs Async**: Long-running tasks need background processing to avoid browser timeouts
+2. **File Handling**: Gradio returns both string paths and file objects - handle both cases
+3. **Progress Updates**: Real-time progress requires proper async architecture
+4. **User Expectations**: Clear warnings about limitations prevent frustration
+5. **Use Case Matching**: Web GUIs work best for short, interactive tasks - CLI is better for long batch jobs
+
 ## Key Configuration
 
 **Default Settings** (optimized for production use):
