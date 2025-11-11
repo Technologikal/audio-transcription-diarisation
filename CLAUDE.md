@@ -21,6 +21,9 @@ Audio Input → FFmpeg (chunk to 10min WAV segments, 16kHz mono)
 
 **Main Components**:
 - `transcription_project/transcribe.py` - Main orchestration script containing `transcribe_with_diarisation()` function
+- `transcription_project/agenda_parser.py` - Parses DOCX agenda files to extract metadata, sections, and speakers
+- `transcription_project/speaker_mapper.py` - Maps anonymous speaker labels to real names using hybrid approach
+- `transcription_project/output_formatter.py` - Generates structured transcripts and executive summaries
 - `transcription_project/debug_pyannote.py` - Utility to test PyAnnote authentication and pipeline loading
 - `transcription_project/.env` - Secure storage for HF_TOKEN (git-ignored)
 - `transcription_project/.env.example` - Template for environment variables
@@ -200,6 +203,8 @@ python3 transcribe.py --help
 - `--verbose` / `-v`: Enable detailed debug logging
 - `--auto-adjust`: Automatically select smaller model if insufficient memory detected
 - `--force`: Force execution even if insufficient memory (may cause OOM errors)
+- `--agenda`: Path to DOCX agenda file for agenda-aware transcription with speaker name mapping
+- `--output-format`: Output format (transcript, summary, or both) [default: **transcript**]. Requires `--agenda`.
 
 ### Debug PyAnnote Setup
 
@@ -209,6 +214,230 @@ python3 debug_pyannote.py
 ```
 
 This validates Hugging Face authentication and tests model loading with debug-level logging.
+
+### Agenda-Aware Transcription (NEW)
+
+The system now supports **agenda-aware transcription** for community meetings. When you provide a meeting agenda (in DOCX format), the system will:
+
+1. **Parse the agenda** to extract meeting metadata (date, time, location), sections/topics, and speaker assignments
+2. **Map anonymous speaker labels** (SPEAKER_00, SPEAKER_01, etc.) to real names using a hybrid approach
+3. **Generate structured output** with named speakers organized by agenda sections
+4. **Create executive summaries** with key discussion points cross-referenced to agenda topics
+
+**Key Features**:
+- Extracts speaker names from agenda documents
+- Maps diarization speakers to real names using temporal analysis and agenda context
+- Provides confidence scores for speaker mappings
+- Generates two output formats:
+  - **Structured Transcript**: Full verbatim with real names, timestamps, and section markers
+  - **Executive Summary**: Meeting overview with key points organized by agenda topics
+
+**Usage Examples**:
+
+```bash
+# Basic agenda-aware transcription (generates structured transcript)
+python3 transcribe.py meeting.m4a --agenda agenda.docx -o output.txt
+
+# Generate executive summary instead of full transcript
+python3 transcribe.py meeting.m4a --agenda agenda.docx --output-format summary -o summary.txt
+
+# Generate both transcript and summary (creates two files)
+python3 transcribe.py meeting.m4a --agenda agenda.docx --output-format both -o meeting.txt
+# This creates: meeting_transcript.txt and meeting_summary.txt
+
+# Combine with other options
+python3 transcribe.py meeting.m4a --agenda agenda.docx --model small --output-format both -o meeting.txt -v
+```
+
+**Agenda Document Requirements**:
+
+The agenda parser is designed to handle semi-structured DOCX files. It looks for:
+
+1. **Metadata** (typically at the top of the document):
+   - Date: "Date: 15 November 2025" or "Meeting Date: 15/11/2025"
+   - Time: "Time: 14:00" or "2:00 PM"
+   - Location: "Location: Community Centre" or "Venue: Main Hall"
+   - Title: "Meeting: Monthly Board Meeting"
+
+2. **Sections/Topics** (identified by):
+   - Heading styles in the document
+   - Section numbers (1., 1.1, A., etc.)
+   - Bold text with short length (< 100 chars)
+
+3. **Speaker Names** (extracted from patterns like):
+   - "Presenter: John Smith"
+   - "Led by: Jane Doe"
+   - "Speaker: John Smith"
+   - "(John Smith)" in section descriptions
+   - "- John Smith" at start of line
+
+**Speaker Mapping Algorithm** (Hybrid Approach):
+
+The system uses a sophisticated hybrid approach to map anonymous speaker labels to real names:
+
+1. **Temporal Alignment**: Divides audio into sections corresponding to agenda topics
+2. **Dominance Analysis**: Identifies which speaker is most active in each section
+3. **Confidence Scoring**: Assigns confidence based on multiple factors:
+   - Dominance ratio in primary section (> 60% = high confidence)
+   - Exclusive speaker assignment (only one speaker listed for section)
+   - Overall speaking time ratio (> 20% = significant contribution)
+4. **Name Assignment**: Maps speakers to names from agenda using evidence-based matching
+
+**Output Format Examples**:
+
+**Structured Transcript**:
+```
+================================================================================
+MEETING TRANSCRIPT
+================================================================================
+
+Meeting: Monthly Community Board Meeting
+Date: 15 November 2025
+Time: 14:00 - 16:00
+Location: Community Centre Main Hall
+
+--------------------------------------------------------------------------------
+
+================================================================================
+SECTION: Welcome and Introductions
+================================================================================
+
+[00:00 - 01:23] Sarah Johnson: Welcome everyone to our monthly board meeting...
+[01:24 - 02:45] Mark Williams: Thank you Sarah. I'd like to start by...
+```
+
+**Executive Summary**:
+```
+================================================================================
+MEETING SUMMARY
+================================================================================
+
+Meeting: Monthly Community Board Meeting
+Date: 15 November 2025
+
+--------------------------------------------------------------------------------
+PARTICIPANTS
+--------------------------------------------------------------------------------
+
+  • Sarah Johnson
+  • Mark Williams
+  • Emily Chen (confidence: 65%)
+
+--------------------------------------------------------------------------------
+AGENDA AND DISCUSSION
+--------------------------------------------------------------------------------
+
+1. Welcome and Introductions
+   Led by: Sarah Johnson
+
+   Discussion highlights:
+
+     • Sarah Johnson: Welcome everyone to our monthly board meeting.
+       Today we'll be discussing the budget proposal and upcoming
+       community events...
+
+     • Mark Williams: Thank you Sarah. I'd like to start by
+       addressing the concerns raised in the last meeting...
+```
+
+**Architecture Components**:
+
+The agenda-aware feature is built using three new modules:
+
+- **`agenda_parser.py`**: Parses DOCX agenda files to extract metadata, sections, and speakers
+  - `AgendaParser` class handles document parsing with flexible pattern matching
+  - `ParsedAgenda` dataclass stores extracted information
+
+- **`speaker_mapper.py`**: Maps anonymous speaker labels to real names
+  - `SpeakerMapper` class implements hybrid mapping algorithm
+  - `SpeakerSegment` dataclass represents individual speech segments
+  - Confidence scoring based on temporal analysis and dominance ratios
+
+- **`output_formatter.py`**: Generates formatted transcripts and summaries
+  - `TranscriptFormatter` creates structured transcripts with named speakers
+  - `SummaryFormatter` generates executive summaries organized by agenda topics
+
+**Dependencies**:
+
+The agenda feature requires the `python-docx` library for parsing DOCX files. This is included in `requirements.txt` and installed automatically with:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Gradio Web GUI (EXPERIMENTAL)
+
+⚠️ **Status: Proof-of-Concept / Prototype**
+
+An experimental web-based GUI is available for testing and demos. **This is NOT recommended for production use** due to known limitations.
+
+**Files:**
+- `transcription_project/gradio_app.py` - Full-featured web interface
+- `transcription_project/gradio_simple.py` - Minimal test interface
+
+**Launch the GUI:**
+
+```bash
+# Activate environment
+source transcription_project/venv/bin/activate
+
+# Launch web interface
+python3 gradio_app.py
+
+# Opens browser to http://localhost:7860
+```
+
+**Features:**
+- 🎤 Audio file upload with drag-and-drop
+- 📄 Optional agenda document upload
+- 🎛️ Model selection and configuration
+- 💻 Real-time system resource monitoring
+- 📊 Tabbed results viewer (Transcript / Summary)
+
+**Known Limitations:**
+
+1. **Browser Timeout for Long Files** ⚠️
+   - The GUI runs transcription synchronously
+   - For audio files > 10-30 minutes, the browser will timeout after 2-5 minutes
+   - The page freezes during processing and may crash
+   - **Workaround**: Use GUI only for short test clips (< 10 minutes)
+   - **Production**: Use CLI for real meeting recordings
+   - **Tracked in**: [Issue #7](https://github.com/Technologikal/audio-transcription-diarisation/issues/7)
+
+2. **Table-Based Agendas Not Supported** ⚠️
+   - The agenda parser only reads paragraphs, not tables
+   - Many real agendas use table layouts (columns for speakers, topics, etc.)
+   - Results in 0 speakers found, no name mapping
+   - **Tracked in**: [Issue #2](https://github.com/Technologikal/audio-transcription-diarisation/issues/2)
+
+**When to Use GUI:**
+- ✅ Testing with short audio clips (< 10 minutes)
+- ✅ Experimenting with different models/settings
+- ✅ Demos and quick trials
+- ✅ Learning the interface
+
+**When to Use CLI:**
+- ✅ **Production transcription** of meeting recordings
+- ✅ Long audio files (> 10 minutes)
+- ✅ Batch processing
+- ✅ Reliable, non-interactive processing
+
+**Future Improvements:**
+
+See GitHub issues for planned enhancements:
+- [Issue #7](https://github.com/Technologikal/audio-transcription-diarisation/issues/7) - Background task processing
+- [Issue #3](https://github.com/Technologikal/audio-transcription-diarisation/issues/3) - Full Gradio implementation
+- [Issue #4](https://github.com/Technologikal/audio-transcription-diarisation/issues/4) - NiceGUI alternative
+- [Issue #5](https://github.com/Technologikal/audio-transcription-diarisation/issues/5) - PyQt6 desktop app
+- [Issue #6](https://github.com/Technologikal/audio-transcription-diarisation/issues/6) - Streamlit dashboard
+
+**Lessons Learned:**
+
+1. **Synchronous vs Async**: Long-running tasks need background processing to avoid browser timeouts
+2. **File Handling**: Gradio returns both string paths and file objects - handle both cases
+3. **Progress Updates**: Real-time progress requires proper async architecture
+4. **User Expectations**: Clear warnings about limitations prevent frustration
+5. **Use Case Matching**: Web GUIs work best for short, interactive tasks - CLI is better for long batch jobs
 
 ## Key Configuration
 

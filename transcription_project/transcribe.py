@@ -14,6 +14,11 @@ import time
 import psutil
 import gc
 from dotenv import load_dotenv
+from typing import Optional
+
+from agenda_parser import parse_agenda, ParsedAgenda
+from speaker_mapper import SpeakerMapper, SpeakerSegment
+from output_formatter import TranscriptFormatter, SummaryFormatter, save_outputs
 
 # Configure logging
 logging.basicConfig(
@@ -124,7 +129,7 @@ def check_memory_requirements(whisper_model_name, auto_adjust=False):
 
     return True, whisper_model_name, None
 
-def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600, whisper_model_name="medium", output_file=None, language="english"):
+def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600, whisper_model_name="medium", output_file=None, language="english", agenda_path: Optional[str] = None, output_format: str = 'transcript'):
     """
     Transcribes an audio file with speaker diarisation, processing in chunks.
 
@@ -135,9 +140,24 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
         whisper_model_name: Name of the Whisper model to use (default: "medium")
         output_file: Optional path to output file. If None, prints to console.
         language: Language code to force (default: "english"). Set to None for auto-detection.
+        agenda_path: Optional path to DOCX agenda file for agenda-aware transcription
+        output_format: Output format: 'transcript', 'summary', or 'both' (default: 'transcript')
     """
     start_time_total = time.time()
     transcription_lines = []
+    speaker_segments = []  # Store as SpeakerSegment objects for agenda-aware processing
+    parsed_agenda = None
+
+    # Parse agenda if provided
+    if agenda_path:
+        if not os.path.exists(agenda_path):
+            logger.error(f"Agenda file not found: {agenda_path}")
+            raise RuntimeError(f"Agenda file not found: {agenda_path}")
+
+        logger.info(f"Parsing agenda document: {agenda_path}")
+        parsed_agenda = parse_agenda(agenda_path)
+        logger.info(f"Agenda parsed: {len(parsed_agenda.sections)} sections, "
+                   f"{len(parsed_agenda.all_speakers)} speakers listed")
 
     logger.info(f"Loading Whisper model: {whisper_model_name}")
     whisper_model = whisper.load_model(whisper_model_name)
@@ -250,6 +270,16 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
 
                 line = f"Speaker {speaker} ({original_start:.2f}s - {original_end:.2f}s): {transcription}"
                 transcription_lines.append(line)
+
+                # Also create SpeakerSegment object for agenda-aware processing
+                segment_obj = SpeakerSegment(
+                    speaker_label=speaker,
+                    start_time=original_start,
+                    end_time=original_end,
+                    text=transcription
+                )
+                speaker_segments.append(segment_obj)
+
                 logger.debug(f"Completed segment {seg_idx}/{len(segments)}")
 
         finally:
@@ -262,14 +292,40 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
     logger.info(f"Transcription complete. Total segments: {len(transcription_lines)}")
     logger.info(f"Total processing time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
 
-    if output_file:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(transcription_lines))
-        logger.info(f"Transcription saved to: {output_file}")
+    # Handle agenda-aware output if agenda was provided
+    if parsed_agenda and speaker_segments:
+        logger.info("Applying speaker mapping and generating agenda-aware output")
+
+        # Map speakers to real names
+        mapper = SpeakerMapper(parsed_agenda)
+        mapped_segments = mapper.map_speakers(speaker_segments)
+        speaker_mappings = mapper.get_all_mappings()
+
+        # Generate formatted output
+        if output_file:
+            save_outputs(mapped_segments, parsed_agenda, speaker_mappings,
+                        output_file, format_type=output_format)
+        else:
+            # Print to console
+            if output_format in ['transcript', 'both']:
+                transcript_formatter = TranscriptFormatter(parsed_agenda)
+                transcript = transcript_formatter.format(mapped_segments, include_timestamps=True)
+                print("\n" + transcript)
+
+            if output_format in ['summary', 'both']:
+                summary_formatter = SummaryFormatter(parsed_agenda)
+                summary = summary_formatter.format(mapped_segments, speaker_mappings)
+                print("\n" + summary)
     else:
-        print("\n--- Transcription Results ---")
-        for line in transcription_lines:
-            print(line)
+        # Original output format (no agenda)
+        if output_file:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(transcription_lines))
+            logger.info(f"Transcription saved to: {output_file}")
+        else:
+            print("\n--- Transcription Results ---")
+            for line in transcription_lines:
+                print(line)
 
 if __name__ == "__main__":
     # Load environment variables from .env file
@@ -322,6 +378,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Force execution even if insufficient memory is detected (may cause OOM errors)"
     )
+    parser.add_argument(
+        "--agenda",
+        help="Path to DOCX agenda file for agenda-aware transcription with speaker name mapping"
+    )
+    parser.add_argument(
+        "--output-format",
+        default="transcript",
+        choices=["transcript", "summary", "both"],
+        help="Output format (default: transcript). Requires --agenda. 'transcript' generates full verbatim with named speakers, 'summary' generates executive summary, 'both' generates separate files for each."
+    )
 
     args = parser.parse_args()
 
@@ -373,9 +439,30 @@ if __name__ == "__main__":
         elif not args.auto_adjust:
             logger.warning("Proceeding with --force flag. System may run out of memory!")
 
+    # Validate agenda-related arguments
+    if args.output_format != "transcript" and not args.agenda:
+        logger.warning("--output-format requires --agenda to be specified. Using default transcript format.")
+        args.output_format = "transcript"
+
+    if args.agenda and not os.path.exists(args.agenda):
+        logger.error(f"Agenda file not found: {args.agenda}")
+        exit(1)
+
     if args.language:
         logger.info(f"Starting transcription of: {args.audio_file} (forced language: {args.language})")
     else:
         logger.info(f"Starting transcription of: {args.audio_file} (auto-detect language)")
 
-    transcribe_with_diarisation(args.audio_file, hf_token, args.chunk_duration, args.model, args.output, args.language)
+    if args.agenda:
+        logger.info(f"Agenda-aware mode enabled with output format: {args.output_format}")
+
+    transcribe_with_diarisation(
+        args.audio_file,
+        hf_token,
+        args.chunk_duration,
+        args.model,
+        args.output,
+        args.language,
+        agenda_path=args.agenda,
+        output_format=args.output_format
+    )

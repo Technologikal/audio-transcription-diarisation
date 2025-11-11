@@ -6,3 +6,5 @@ soundfile
 numpy
 python-dotenv
 psutil
+python-docx
+gradio>=4.0.0
