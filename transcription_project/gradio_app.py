@@ -17,12 +17,14 @@ import logging
 from typing import Optional, Tuple
 import psutil
 
-from transcribe import (
+from pipeline import (
     transcribe_with_diarisation,
     check_memory_requirements,
+    TranscriptionResult,
     WHISPER_MODEL_MEMORY,
-    PYANNOTE_MEMORY
+    PYANNOTE_MEMORY,
 )
+from output_formatter import TranscriptFormatter, SummaryFormatter
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -131,64 +133,48 @@ def transcribe_audio(
         if language == "Auto-detect":
             language = None
 
-        # Create temporary output file
-        import tempfile
-        output_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False).name
-
         # Update progress
         progress(0.1, desc="Loading models...")
 
         # Run transcription
         logger.info(f"Starting transcription via Gradio: {audio_path}")
 
-        transcribe_with_diarisation(
+        result = transcribe_with_diarisation(
             audio_path=audio_path,
             hf_token=hf_token,
             chunk_duration_seconds=chunk_duration,
             whisper_model_name=model,
-            output_file=output_file,
             language=language,
             agenda_path=agenda_path,
-            output_format=output_format if agenda_path else 'transcript'
         )
 
         progress(1.0, desc="Complete!")
 
-        # Read results
+        # Format results
         transcript_text = ""
         summary_text = ""
+        effective_format = output_format if agenda_path else 'transcript'
 
-        if agenda_path and output_format == 'both':
-            # Two separate files created
-            transcript_file = output_file.replace('.txt', '_transcript.txt')
-            summary_file = output_file.replace('.txt', '_summary.txt')
+        if result.parsed_agenda and result.mapped_segments:
+            # Agenda-aware output with named speakers
+            if effective_format in ['transcript', 'both']:
+                formatter = TranscriptFormatter(result.parsed_agenda)
+                transcript_text = formatter.format(result.mapped_segments, include_timestamps=True)
 
-            if os.path.exists(transcript_file):
-                with open(transcript_file, 'r', encoding='utf-8') as f:
-                    transcript_text = f.read()
+            if effective_format in ['summary', 'both']:
+                formatter = SummaryFormatter(result.parsed_agenda)
+                summary_text = formatter.format(result.mapped_segments, result.speaker_mappings)
 
-            if os.path.exists(summary_file):
-                with open(summary_file, 'r', encoding='utf-8') as f:
-                    summary_text = f.read()
-
-            status += "✅ **Transcription Complete!**\n\nBoth transcript and summary generated successfully."
-
-        elif os.path.exists(output_file):
-            with open(output_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            if agenda_path and output_format == 'summary':
-                summary_text = content
+            if effective_format == 'both':
+                status += "✅ **Transcription Complete!**\n\nBoth transcript and summary generated successfully."
+            elif effective_format == 'summary':
                 status += "✅ **Summary Generated!**\n\nExecutive summary created successfully."
             else:
-                transcript_text = content
                 status += "✅ **Transcription Complete!**\n\nFull transcript generated successfully."
-
-        # Clean up temp file
-        try:
-            os.unlink(output_file)
-        except:
-            pass
+        else:
+            # Plain transcript output
+            transcript_text = '\n'.join(result.transcription_lines)
+            status += "✅ **Transcription Complete!**\n\nFull transcript generated successfully."
 
         return transcript_text, summary_text, status
 

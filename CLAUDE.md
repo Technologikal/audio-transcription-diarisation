@@ -12,12 +12,15 @@ The system uses a **chunked processing pipeline** to handle large audio files:
 
 ```
 Audio Input → FFmpeg (chunk to 10min WAV segments, 16kHz mono)
+  → Whisper (transcribe full chunk with word-level timestamps)
   → PyAnnote (identify speaker segments)
-  → For each speaker segment: extract audio → Whisper (transcribe)
+  → Align words to speakers (midpoint-based temporal matching)
   → Output: Speaker + Timestamps + Text
 ```
 
-**Key Design Pattern**: Large audio files are processed in 10-minute chunks to prevent memory overflow. Each chunk is independently diarized, then individual speaker segments within the chunk are transcribed. Timestamps are adjusted to maintain continuity across chunks.
+**Key Design Pattern**: Large audio files are processed in 10-minute chunks to prevent memory overflow. Each chunk is first transcribed in full by Whisper (with word-level timestamps), then PyAnnote identifies speaker segments, and finally words are aligned to speakers using temporal matching. This **transcribe-first** approach gives Whisper full context for each chunk, producing significantly better accuracy than the legacy per-segment approach.
+
+A `--legacy` flag is available to revert to the original per-segment transcription if needed.
 
 **Main Components**:
 - `transcription_project/transcribe.py` - Main orchestration script containing `transcribe_with_diarisation()` function
@@ -205,6 +208,15 @@ python3 transcribe.py --help
 - `--force`: Force execution even if insufficient memory (may cause OOM errors)
 - `--agenda`: Path to DOCX agenda file for agenda-aware transcription with speaker name mapping
 - `--output-format`: Output format (transcript, summary, or both) [default: **transcript**]. Requires `--agenda`.
+- `--legacy`: Use legacy per-segment transcription instead of full-chunk word alignment (slower, less accurate)
+- `--prompt`: Initial context prompt for Whisper (domain terms, speaker names). Auto-generated from agenda if `--agenda` is provided.
+- `--beam-size`: Beam search width for Whisper decoding [default: Whisper's default of 5]. Higher = more accurate, slower.
+- `--best-of`: Number of candidate decodings to evaluate [default: Whisper's default of 5]. Higher = more accurate, slower.
+- `--compression-ratio-threshold`: Discard segments above this ratio as likely hallucinated [default: 2.4]
+- `--logprob-threshold`: Discard segments with average log probability below this value [default: -1.0]
+- `--no-speech-threshold`: Discard segments where no-speech probability exceeds this value [default: 0.6]
+- `--normalise`: Apply EBU R128 loudness normalisation to audio before transcription
+- `--denoise`: Apply FFT-based noise reduction to audio before transcription
 
 ### Debug PyAnnote Setup
 
@@ -488,11 +500,14 @@ See GitHub issues for planned enhancements:
 The `transcribe_with_diarisation()` function processes long audio files in configurable chunks (default 600s) to avoid memory issues. For each chunk:
 
 1. FFmpeg extracts chunk to temporary WAV file (`temp_chunk_{start_time}.wav`)
-2. PyAnnote performs diarisation on chunk
-3. **Entire chunk is read into memory** (avoids file seeking issues)
-4. Each speaker segment within chunk is individually transcribed
-5. Timestamps are adjusted to reflect position in original file: `original_start = start_time + turn.start`
-6. Temporary chunk file is deleted (guaranteed by try/finally block)
+2. **Whisper transcribes the full chunk** with `word_timestamps=True`, producing word-level timing data
+3. PyAnnote performs diarisation on chunk, identifying speaker segments
+4. **Words are aligned to speakers** using midpoint-based temporal matching (with 0.1s tolerance for gaps and overlap handling)
+5. Consecutive same-speaker words are grouped into `SpeakerSegment` objects (new segment on speaker change or >2s gap)
+6. Timestamps are adjusted to reflect position in original file: `chunk_start_time + word.start`
+7. Temporary chunk file is deleted (guaranteed by try/finally block)
+
+With `--legacy` mode, the original per-segment transcription is used instead (steps 2-5 revert to: diarise → slice per speaker → transcribe each segment independently).
 
 ### GPU Acceleration
 
@@ -785,22 +800,33 @@ For transcribing meeting recordings:
    python3 transcribe.py meeting.m4a --auto-adjust -o meeting.txt
    ```
 
-3. **For highest accuracy** - use large model with auto-adjust safety:
+3. **For highest accuracy** - use large model with tuned decoding parameters:
    ```bash
-   python3 transcribe.py meeting.m4a --model large --auto-adjust -o meeting.txt
+   python3 transcribe.py meeting.m4a --model large --auto-adjust --beam-size 10 --best-of 10 -o meeting.txt -v
    ```
 
-4. **For faster processing** (with slight accuracy trade-off):
+4. **Maximum accuracy with agenda** - combines all accuracy features:
+   ```bash
+   python3 transcribe.py meeting.m4a --model large --auto-adjust --agenda agenda.docx --beam-size 10 --best-of 10 --normalise --output-format both -o meeting.txt -v
+   ```
+   This auto-generates a Whisper prompt from the agenda (speaker names, topics), uses wider beam search, normalises audio levels, and produces both transcript and summary.
+
+5. **For noisy recordings** - apply denoising and normalisation:
+   ```bash
+   python3 transcribe.py meeting.m4a --denoise --normalise -o meeting.txt -v
+   ```
+
+6. **For faster processing** (with slight accuracy trade-off):
    ```bash
    python3 transcribe.py meeting.m4a --model small -o meeting.txt
    ```
 
-5. **For bilingual meetings**:
+7. **For bilingual meetings**:
    ```bash
    python3 transcribe.py meeting.m4a --language None -o meeting.txt
    ```
 
-6. **Monitor progress and resource usage** with verbose mode:
+8. **Monitor progress and resource usage** with verbose mode:
    ```bash
    python3 transcribe.py meeting.m4a -v -o meeting.txt
    ```
