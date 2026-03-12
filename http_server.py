@@ -8,6 +8,11 @@ via multipart upload and receives plain transcript text.
 Endpoints:
     POST /transcribe  — multipart file upload → {"transcript": "..."}
     GET  /health      — returns 200 when ready
+
+Note: The Crucible bridge has a 30s timeout for transcription requests.
+With large-v3 on CPU, a 1-minute voice note takes ~2-3 minutes to process.
+The bridge timeout will need increasing, or the bridge should poll/stream.
+This becomes negligible with GPU (e.g. RTX 3060 upgrade).
 """
 
 import logging
@@ -61,7 +66,11 @@ async def transcribe(file: UploadFile = File(...)):
     """Transcribe an uploaded audio file and return plain transcript text.
 
     Optimised for short voice notes (< 2 minutes, single speaker).
-    Uses the medium model with no wav2vec2 alignment for speed.
+    Uses large-v3 for accuracy. Skips wav2vec2 alignment (not needed for
+    plain transcript output). WHISPER_MODEL env var can override.
+
+    Future: add option to skip diarisation entirely for single-speaker
+    voice notes — would reduce processing time significantly on CPU.
 
     Args:
         file: Audio file (multipart upload, field name "file")
@@ -90,7 +99,7 @@ async def transcribe(file: UploadFile = File(...)):
         result = transcribe_with_diarisation(
             audio_path=tmp_path,
             hf_token=hf_token,
-            whisper_model_name=os.environ.get("WHISPER_MODEL", "medium"),
+            whisper_model_name=os.environ.get("WHISPER_MODEL", "large-v3"),
             language="english",
             chunk_duration_seconds=300,  # Shorter chunks for voice notes
             use_alignment=False,         # Skip wav2vec2 for speed

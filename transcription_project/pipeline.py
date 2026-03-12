@@ -608,6 +608,9 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
     return speaker_segments, transcription_lines, total_duration
 
 
+# TODO: add skip_diarisation parameter — for single-speaker audio (e.g. voice notes),
+# skipping PyAnnote entirely would significantly reduce processing time on CPU.
+# All segments would be labelled SPEAKER_00. See http_server.py voice note use case.
 def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600,
                                  whisper_model_name="medium", language="english",
                                  agenda_path: Optional[str] = None,
