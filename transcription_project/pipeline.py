@@ -159,19 +159,21 @@ def get_system_resources():
     return resources
 
 
-def check_memory_requirements(whisper_model_name, auto_adjust=False):
+def check_memory_requirements(whisper_model_name, auto_adjust=False, skip_diarisation=False):
     """
     Check if system has enough memory to run the models.
 
     Args:
         whisper_model_name: Name of the Whisper model to use
         auto_adjust: If True, automatically suggest a smaller model if insufficient memory
+        skip_diarisation: If True, exclude PyAnnote memory from requirements
 
     Returns:
         tuple: (can_proceed, recommended_model, warning_message)
     """
     resources = get_system_resources()
-    required_memory = WHISPER_MODEL_MEMORY.get(whisper_model_name, 5.0) + PYANNOTE_MEMORY
+    pyannote_mem = 0 if skip_diarisation else PYANNOTE_MEMORY
+    required_memory = WHISPER_MODEL_MEMORY.get(whisper_model_name, 5.0) + pyannote_mem
 
     # Determine which memory pool to check (GPU VRAM or CPU RAM)
     if resources['has_cuda'] and resources['available_vram_gb'] is not None:
@@ -608,9 +610,6 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
     return speaker_segments, transcription_lines, total_duration
 
 
-# TODO: add skip_diarisation parameter — for single-speaker audio (e.g. voice notes),
-# skipping PyAnnote entirely would significantly reduce processing time on CPU.
-# All segments would be labelled SPEAKER_00. See http_server.py voice note use case.
 def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600,
                                  whisper_model_name="medium", language="english",
                                  agenda_path: Optional[str] = None,
@@ -625,7 +624,8 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                                  denoise_audio: bool = False,
                                  compute_type: Optional[str] = None,
                                  backend: str = "faster-whisper",
-                                 use_alignment: bool = True) -> TranscriptionResult:
+                                 use_alignment: bool = True,
+                                 skip_diarisation: bool = False) -> TranscriptionResult:
     """
     Transcribes an audio file with speaker diarisation, processing in chunks.
 
@@ -653,6 +653,9 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                       If None, auto-selects float16 for GPU or int8 for CPU.
         backend: Transcription backend ("faster-whisper" or "whisperx")
         use_alignment: If True, refine timestamps with wav2vec2 alignment (default: True)
+        skip_diarisation: If True, skip PyAnnote speaker diarisation entirely. All segments
+            are labelled SPEAKER_00. Significantly faster on CPU — use for single-speaker
+            audio like voice notes. Default: False.
 
     Returns:
         TranscriptionResult with segments, lines, and optional agenda data
@@ -714,16 +717,20 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
             compute_type=compute_type,
         )
 
-        logger.info("Loading PyAnnote speaker diarisation pipeline")
-        diarisation_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token
-        )
+        diarisation_pipeline = None
+        if skip_diarisation:
+            logger.info("Diarisation SKIPPED — all segments will be labelled SPEAKER_00")
+        else:
+            logger.info("Loading PyAnnote speaker diarisation pipeline")
+            diarisation_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
 
-        # Send pipeline to GPU if available
-        if torch.cuda.is_available():
-            diarisation_pipeline.to(torch.device("cuda"))
-            logger.info("Using GPU acceleration (CUDA)")
+            # Send pipeline to GPU if available
+            if torch.cuda.is_available():
+                diarisation_pipeline.to(torch.device("cuda"))
+                logger.info("Using GPU acceleration (CUDA)")
 
         # Get audio duration using ffprobe
         probe_cmd = [
@@ -890,35 +897,48 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     logger.debug(f"faster-whisper produced {len(all_words)} words for chunk {chunk_idx}")
 
                     # Optional: refine timestamps with wav2vec2 alignment
-                    if use_alignment and all_words:
+                    if use_alignment and all_words and not skip_diarisation:
                         logger.debug(f"Refining timestamps with wav2vec2 alignment for chunk {chunk_idx}")
                         all_words = _refine_timestamps_with_wav2vec2(
                             all_words, chunk_file, language, device
                         )
 
-                    # Step 2: Run speaker diarisation
-                    logger.debug(f"Running speaker diarisation on chunk {chunk_idx}")
-                    diarisation = diarisation_pipeline(chunk_file)
-
-                    diar_segments = list(diarisation.itertracks(yield_label=True))
-                    logger.debug(f"Found {len(diar_segments)} diarisation segments in chunk {chunk_idx}")
-
-                    # Step 3: Align words to speakers and group into SpeakerSegments
-                    if all_words and diar_segments:
-                        chunk_speaker_segments = assign_and_group_words(
-                            all_words, diar_segments, start_time, max_gap=2.0
-                        )
-                    elif all_words:
-                        # No diarisation segments — assign all words to UNKNOWN
-                        text = "".join(w["word"] for w in all_words).strip()
-                        chunk_speaker_segments = [SpeakerSegment(
-                            speaker_label="UNKNOWN",
-                            start_time=start_time + all_words[0]["start"],
-                            end_time=start_time + all_words[-1]["end"],
-                            text=text
-                        )]
+                    if skip_diarisation:
+                        # Skip PyAnnote — group all words into SPEAKER_00 segments
+                        if all_words:
+                            text = "".join(w["word"] for w in all_words).strip()
+                            chunk_speaker_segments = [SpeakerSegment(
+                                speaker_label="SPEAKER_00",
+                                start_time=start_time + all_words[0]["start"],
+                                end_time=start_time + all_words[-1]["end"],
+                                text=text
+                            )]
+                        else:
+                            chunk_speaker_segments = []
                     else:
-                        chunk_speaker_segments = []
+                        # Step 2: Run speaker diarisation
+                        logger.debug(f"Running speaker diarisation on chunk {chunk_idx}")
+                        diarisation = diarisation_pipeline(chunk_file)
+
+                        diar_segments = list(diarisation.itertracks(yield_label=True))
+                        logger.debug(f"Found {len(diar_segments)} diarisation segments in chunk {chunk_idx}")
+
+                        # Step 3: Align words to speakers and group into SpeakerSegments
+                        if all_words and diar_segments:
+                            chunk_speaker_segments = assign_and_group_words(
+                                all_words, diar_segments, start_time, max_gap=2.0
+                            )
+                        elif all_words:
+                            # No diarisation segments — assign all words to UNKNOWN
+                            text = "".join(w["word"] for w in all_words).strip()
+                            chunk_speaker_segments = [SpeakerSegment(
+                                speaker_label="UNKNOWN",
+                                start_time=start_time + all_words[0]["start"],
+                                end_time=start_time + all_words[-1]["end"],
+                                text=text
+                            )]
+                        else:
+                            chunk_speaker_segments = []
 
                     # Step 4: Append results
                     for seg_obj in chunk_speaker_segments:

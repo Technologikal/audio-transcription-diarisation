@@ -66,11 +66,9 @@ async def transcribe(file: UploadFile = File(...)):
     """Transcribe an uploaded audio file and return plain transcript text.
 
     Optimised for short voice notes (< 2 minutes, single speaker).
-    Uses large-v3 for accuracy. Skips wav2vec2 alignment (not needed for
-    plain transcript output). WHISPER_MODEL env var can override.
-
-    Future: add option to skip diarisation entirely for single-speaker
-    voice notes — would reduce processing time significantly on CPU.
+    Uses large-v3 for accuracy. Skips wav2vec2 alignment and PyAnnote
+    diarisation (not needed for single-speaker voice notes — significantly
+    faster on CPU). WHISPER_MODEL env var can override.
 
     Args:
         file: Audio file (multipart upload, field name "file")
@@ -80,12 +78,9 @@ async def transcribe(file: UploadFile = File(...)):
     """
     _ensure_pipeline()
 
+    # HF_TOKEN only needed when diarisation is enabled. With skip_diarisation=True
+    # and models baked into the image, we can proceed without it.
     hf_token = os.environ.get("HF_TOKEN", "")
-    if not hf_token:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "HF_TOKEN not configured"},
-        )
 
     # Write uploaded file to a temporary location
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
@@ -103,6 +98,7 @@ async def transcribe(file: UploadFile = File(...)):
             language="english",
             chunk_duration_seconds=300,  # Shorter chunks for voice notes
             use_alignment=False,         # Skip wav2vec2 for speed
+            skip_diarisation=True,       # Single speaker — skip PyAnnote for speed
             backend="faster-whisper",
         )
 

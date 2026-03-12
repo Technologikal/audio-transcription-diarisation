@@ -73,6 +73,7 @@ def transcribe_audio(
     beam_size: Optional[int] = None,
     normalise: bool = False,
     denoise: bool = False,
+    skip_diarisation: bool = False,
 ) -> str:
     """Transcribe an audio file with speaker diarisation.
 
@@ -90,6 +91,8 @@ def transcribe_audio(
         beam_size: Beam search width for decoding (higher = more accurate, slower)
         normalise: Apply EBU R128 loudness normalisation before transcription
         denoise: Apply FFT-based noise reduction before transcription
+        skip_diarisation: Skip speaker diarisation — all segments labelled SPEAKER_00.
+            Much faster on CPU. Use for single-speaker audio like voice notes. (default: False)
     """
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
@@ -123,6 +126,7 @@ def transcribe_audio(
             beam_size=beam_size,
             normalise_audio=normalise,
             denoise_audio=denoise,
+            skip_diarisation=skip_diarisation,
         )
 
         output = {
