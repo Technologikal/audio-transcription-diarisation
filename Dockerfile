@@ -1,17 +1,16 @@
 # Crucible-compatible Dockerfile for audio-transcription-diarisation
 # Dual-mode: SERVER_MODE=http (Zone 3 pre-processing) or SERVER_MODE=mcp (Zone 5a tool)
 #
-# Build:
-#   docker build --build-arg HF_TOKEN=hf_xxx \
-#     -t registry.local:5000/crucible/voice-transcription:1.0.0 .
+# Build (models copied from host cache — fast):
+#   docker build -t registry.local:5000/crucible/voice-transcription:1.0.0 .
 #
 # Run:
 #   docker run -e SERVER_MODE=http -p 8001:8001 voice-transcription
 #   docker run -e SERVER_MODE=mcp voice-transcription
 #
 # Models are baked into the image at build time — no internet needed at runtime.
-# HF_TOKEN is required at BUILD time for PyAnnote model download.
-# At runtime, HF_TOKEN is read from /run/secrets/hf_token (Docker secrets).
+# Prerequisites: models must be cached on the host in ~/.cache/huggingface/hub/
+# (they are downloaded automatically on first use of the CLI tool).
 
 FROM python:3.12-slim
 
@@ -31,24 +30,13 @@ RUN grep -v '^gradio' /tmp/requirements.txt > /tmp/requirements-server.txt \
     && pip install --no-cache-dir fastapi uvicorn python-multipart \
     && rm /tmp/requirements.txt /tmp/requirements-server.txt
 
-# Bake faster-whisper large-v3 model into image (~3GB download, cached in layer).
-# CTranslate2 format is downloaded on first use — trigger it now.
-RUN python3 -c "\
-from faster_whisper import WhisperModel; \
-WhisperModel('large-v3', compute_type='int8')"
-
-# Bake PyAnnote models into image (requires HF_TOKEN at build time).
-# This downloads pyannote/speaker-diarisation-3.1 and its dependencies
-# (pyannote/segmentation-3.0, wespeaker-voxceleb-resnet34-LM, etc.).
-ARG HF_TOKEN
-RUN if [ -z "$HF_TOKEN" ]; then \
-        echo "ERROR: HF_TOKEN build arg is required to bake PyAnnote models." && \
-        echo "Usage: docker build --build-arg HF_TOKEN=hf_xxx ..." && \
-        exit 1; \
-    fi && \
-    python3 -c "\
-from pyannote.audio import Pipeline; \
-Pipeline.from_pretrained('pyannote/speaker-diarisation-3.1', use_auth_token='${HF_TOKEN}')"
+# Bake models from host cache into image (avoids slow in-container downloads).
+# These are copied from ~/.cache/huggingface/hub/ on the build host.
+# The HuggingFace hub library looks for models here at runtime.
+COPY hf_cache/models--Systran--faster-whisper-large-v3 /root/.cache/huggingface/hub/models--Systran--faster-whisper-large-v3
+COPY hf_cache/models--pyannote--segmentation-3.0 /root/.cache/huggingface/hub/models--pyannote--segmentation-3.0
+COPY hf_cache/models--pyannote--speaker-diarization-3.1 /root/.cache/huggingface/hub/models--pyannote--speaker-diarization-3.1
+COPY hf_cache/models--pyannote--wespeaker-voxceleb-resnet34-LM /root/.cache/huggingface/hub/models--pyannote--wespeaker-voxceleb-resnet34-LM
 
 # Copy application source
 COPY transcription_project/ /app/
