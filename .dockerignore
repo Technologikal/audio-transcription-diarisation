@@ -1,0 +1,55 @@
+# Git
+.git
+.gitignore
+
+# Virtual environments
+venv/
+ENV/
+.venv/
+
+# Environment files (secrets — never bake into image)
+.env
+*.env
+!.env.example
+
+# Audio files and test data
+transcription_project/audio/
+*.m4a
+*.wav
+*.mp3
+*.flac
+*.tar.gz
+*.zip
+
+# Output files
+*_transcription.txt
+transcription_output.txt
+
+# Documents
+*.doc
+*.docx
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gradio (not needed in container)
+transcription_project/gradio_app.py
+transcription_project/gradio_simple.py
+
+# Debug utilities (not needed in container)
+transcription_project/debug_pyannote.py
+
+# Root-level scripts not needed in container
+build_minutes_docx.py
+generate_minutes.py

@@ -1,16 +1,18 @@
 # Audio Transcription with Speaker Diarisation
 
-A Python-based audio transcription pipeline that combines OpenAI Whisper (speech-to-text) with PyAnnote.audio (speaker identification) to transcribe meeting recordings and attribute text to specific speakers.
+A Python-based audio transcription pipeline that combines faster-whisper (CTranslate2-based, ~4x faster than openai-whisper) with PyAnnote.audio (speaker identification) and optional wav2vec2 alignment to transcribe meeting recordings and attribute text to specific speakers.
 
 ## Features
 
-- 🎙️ **Speaker Diarisation**: Automatically identifies and labels different speakers
-- 🗣️ **Multi-Language Support**: Transcribe in 99 languages or auto-detect
-- 🧠 **Smart Memory Management**: Automatic resource checking prevents OOM crashes
-- ⚡ **GPU Acceleration**: Automatically uses CUDA when available
-- 📦 **Chunked Processing**: Handles large audio files by processing in segments
-- 🔒 **Secure**: Token management via `.env` files
-- 🎛️ **Flexible Models**: Choose from 7 Whisper models (tiny to large)
+- **Speaker Diarisation**: Automatically identifies and labels different speakers
+- **Multi-Language Support**: Transcribe in 99 languages or auto-detect
+- **Smart Memory Management**: Automatic resource checking prevents OOM crashes
+- **GPU Acceleration**: Automatically uses CUDA when available
+- **Chunked Processing**: Handles large audio files by processing in segments
+- **Agenda-Aware Mode**: Map anonymous speakers to real names using a DOCX agenda
+- **MCP Server**: Expose transcription as tools for Claude via FastMCP
+- **Dual Backend**: faster-whisper (default) or WhisperX
+- **Docker/Crucible Support**: Dockerfile for containerised deployment
 
 ## Quick Start
 
@@ -31,20 +33,20 @@ python3 transcribe.py audio_file.m4a -o output.txt
 
 ## Memory Requirements
 
-The script automatically checks available RAM/VRAM before loading models:
+The script automatically checks available RAM/VRAM before loading models.
+faster-whisper uses CTranslate2 optimisation, requiring significantly less memory than openai-whisper:
 
-| Model | Memory Needed | Recommended RAM |
-|-------|---------------|-----------------|
-| tiny | 3.5 GB | 4+ GB |
-| base | 4.0 GB | 5+ GB |
-| small | 5.0 GB | 6+ GB |
-| medium (default) | 7.5 GB | 9+ GB |
-| large | 12.5 GB | 15+ GB |
+| Model | Total Memory | Recommended RAM/VRAM |
+|-------|-------------|----------------------|
+| tiny | 3.0 GB | 4+ GB |
+| small | 3.5 GB | 5+ GB |
+| medium (default) | 4.5 GB | 6+ GB |
+| large-v3 | 5.5 GB | 7+ GB |
 
 **Pro tip**: Use `--auto-adjust` to automatically select the best model for your system:
 
 ```bash
-python3 transcribe.py audio.m4a --model large --auto-adjust -o output.txt
+python3 transcribe.py audio.m4a --model large-v3 --auto-adjust -o output.txt
 ```
 
 ## Usage Examples
@@ -53,27 +55,24 @@ python3 transcribe.py audio.m4a --model large --auto-adjust -o output.txt
 # Basic usage (medium model, English)
 python3 transcribe.py meeting.m4a -o transcription.txt
 
-# Use smaller model for faster processing
-python3 transcribe.py meeting.m4a --model small -o output.txt
+# Use large-v3 for highest accuracy
+python3 transcribe.py meeting.m4a --model large-v3 --auto-adjust -o output.txt
 
-# Auto-adjust model based on available memory
-python3 transcribe.py meeting.m4a --model large --auto-adjust -o output.txt
+# Agenda-aware transcription with speaker names
+python3 transcribe.py meeting.m4a --agenda agenda.docx --output-format both -o meeting.txt
 
-# Welsh language transcription
-python3 transcribe.py meeting.m4a --language welsh -o output.txt
+# Audio pre-processing (denoise + normalise)
+python3 transcribe.py meeting.m4a --denoise --normalise -o output.txt
 
-# Auto-detect language
-python3 transcribe.py meeting.m4a --language None -o output.txt
-
-# Verbose logging for detailed progress
-python3 transcribe.py meeting.m4a -v -o output.txt
+# MCP server mode (for Claude integration)
+python3 mcp_server.py
 ```
 
 ## Requirements
 
-- Python 3.13.7+
+- Python 3.12+
 - FFmpeg (for audio processing)
-- 4-15GB RAM (depending on model choice)
+- 4-7GB RAM (depending on model choice)
 - Optional: CUDA-capable GPU for acceleration
 - Hugging Face account with access to PyAnnote models
 
@@ -84,7 +83,6 @@ See [CLAUDE.md](CLAUDE.md) for comprehensive documentation including:
 - Setup instructions
 - Performance benchmarks
 - Development conventions
-- Troubleshooting guide
 
 ## Output Format
 
@@ -94,9 +92,9 @@ Speaker SPEAKER_01 (3.80s - 8.15s): Thank you for having me today.
 Speaker SPEAKER_00 (8.90s - 12.45s): Let's start with the first agenda item.
 ```
 
-## License
+## Licence
 
-[Your chosen license]
+[Your chosen licence]
 
 ## Contributing
 

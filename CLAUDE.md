@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Python-based audio transcription and speaker diarisation pipeline that combines OpenAI Whisper (speech-to-text) with PyAnnote.audio (speaker identification) to transcribe meeting recordings and attribute text to specific speakers.
+This is a Python-based audio transcription and speaker diarisation pipeline that combines faster-whisper (CTranslate2-based Whisper, ~4x faster than openai-whisper) with PyAnnote.audio (speaker identification) and optional wav2vec2 alignment (via WhisperX) to transcribe meeting recordings and attribute text to specific speakers.
+
+The tool has three frontends: CLI (`transcribe.py`), MCP server (`mcp_server.py` via FastMCP), and an experimental Gradio web GUI.
 
 ## Architecture
 
@@ -12,24 +14,37 @@ The system uses a **chunked processing pipeline** to handle large audio files:
 
 ```
 Audio Input → FFmpeg (chunk to 10min WAV segments, 16kHz mono)
-  → Whisper (transcribe full chunk with word-level timestamps)
+  → faster-whisper (transcribe full chunk with word-level timestamps)
+  → Optional: wav2vec2 alignment (refine word boundaries via WhisperX)
   → PyAnnote (identify speaker segments)
   → Align words to speakers (midpoint-based temporal matching)
   → Output: Speaker + Timestamps + Text
 ```
 
-**Key Design Pattern**: Large audio files are processed in 10-minute chunks to prevent memory overflow. Each chunk is first transcribed in full by Whisper (with word-level timestamps), then PyAnnote identifies speaker segments, and finally words are aligned to speakers using temporal matching. This **transcribe-first** approach gives Whisper full context for each chunk, producing significantly better accuracy than the legacy per-segment approach.
+**Key Design Pattern**: Large audio files are processed in 10-minute chunks to prevent memory overflow. Each chunk is first transcribed in full by faster-whisper (with word-level timestamps), optionally refined with wav2vec2 alignment, then PyAnnote identifies speaker segments, and finally words are aligned to speakers using temporal matching. This **transcribe-first** approach gives Whisper full context for each chunk, producing significantly better accuracy than the legacy per-segment approach.
+
+Two backends are supported:
+- **faster-whisper** (default): CTranslate2-based Whisper with manual PyAnnote diarisation and optional wav2vec2 alignment
+- **whisperx**: Full WhisperX pipeline with integrated diarisation
 
 A `--legacy` flag is available to revert to the original per-segment transcription if needed.
 
 **Main Components**:
-- `transcription_project/transcribe.py` - Main orchestration script containing `transcribe_with_diarisation()` function
+- `transcription_project/pipeline.py` - Core transcription engine with `transcribe_with_diarisation()` — imported by all frontends
+- `transcription_project/transcribe.py` - CLI wrapper (argument parsing, validation, output handling)
+- `transcription_project/mcp_server.py` - MCP server via FastMCP (tools: `transcribe_audio`, `map_speakers_from_agenda`, `check_system_resources`)
 - `transcription_project/agenda_parser.py` - Parses DOCX agenda files to extract metadata, sections, and speakers
 - `transcription_project/speaker_mapper.py` - Maps anonymous speaker labels to real names using hybrid approach
 - `transcription_project/output_formatter.py` - Generates structured transcripts and executive summaries
 - `transcription_project/debug_pyannote.py` - Utility to test PyAnnote authentication and pipeline loading
 - `transcription_project/.env` - Secure storage for HF_TOKEN (git-ignored)
 - `transcription_project/.env.example` - Template for environment variables
+
+**Crucible Integration Files** (at repo root):
+- `Dockerfile` - Dual-mode container (SERVER_MODE=http for Zone 3 pre-processing, SERVER_MODE=mcp for Zone 5a tool)
+- `server.py` - Entry point that routes to http_server or mcp_server based on SERVER_MODE
+- `read_secret.py` - Docker secret reader with env var fallback for local dev
+- `crucible/integration-contract.md` - Stable interface declarations for Crucible
 
 ## Setup and Dependencies
 
@@ -120,17 +135,20 @@ export HF_TOKEN="your_hugging_face_access_token"
 
 The script requires sufficient RAM (or VRAM if using GPU) to load both the Whisper model and PyAnnote diarisation pipeline simultaneously. **Resource checking is performed automatically before model loading** to prevent out-of-memory (OOM) errors.
 
-**Memory Requirements by Model** (approximate GB needed):
+**Memory Requirements by Model** (approximate GB needed, faster-whisper with CTranslate2):
 
-| Model | Whisper | PyAnnote | Total | Recommended RAM/VRAM |
-|-------|---------|----------|-------|----------------------|
-| `tiny` | 1.0 GB | 2.5 GB | 3.5 GB | 4+ GB |
-| `base` | 1.5 GB | 2.5 GB | 4.0 GB | 5+ GB |
-| `small` | 2.5 GB | 2.5 GB | 5.0 GB | 6+ GB |
-| `medium` | 5.0 GB | 2.5 GB | 7.5 GB | 9+ GB |
-| `turbo` | 6.0 GB | 2.5 GB | 8.5 GB | 10+ GB |
-| `large-v3-turbo` | 8.0 GB | 2.5 GB | 10.5 GB | 13+ GB |
-| `large` | 10.0 GB | 2.5 GB | 12.5 GB | 15+ GB |
+| Model | faster-whisper | PyAnnote | Total | Recommended RAM/VRAM |
+|-------|---------------|----------|-------|----------------------|
+| `tiny` | 0.5 GB | 2.5 GB | 3.0 GB | 4+ GB |
+| `base` | 0.5 GB | 2.5 GB | 3.0 GB | 4+ GB |
+| `small` | 1.0 GB | 2.5 GB | 3.5 GB | 5+ GB |
+| `medium` | 2.0 GB | 2.5 GB | 4.5 GB | 6+ GB |
+| `turbo` | 2.0 GB | 2.5 GB | 4.5 GB | 6+ GB |
+| `distil-large-v3` | 1.5 GB | 2.5 GB | 4.0 GB | 5+ GB |
+| `large-v3-turbo` | 2.5 GB | 2.5 GB | 5.0 GB | 7+ GB |
+| `large-v3` | 3.0 GB | 2.5 GB | 5.5 GB | 7+ GB |
+
+Note: faster-whisper uses CTranslate2 optimisation, requiring significantly less memory than openai-whisper.
 
 **Automatic Resource Management**:
 
@@ -462,24 +480,24 @@ See GitHub issues for planned enhancements:
 - Logging level: INFO - use `--verbose` for DEBUG level
 
 **Available Whisper Models** (smallest to largest):
-`tiny`, `base`, `small`, `medium`, `large`, `large-v3-turbo`, `turbo`
+`tiny`, `base`, `small`, `medium`, `turbo`, `distil-large-v3`, `large-v3-turbo`, `large-v2`, `large-v3`, `large`
 
-**Model Selection Guidance**:
-- `tiny`: Fastest, lowest accuracy - good for quick tests (requires ~4GB RAM, not recommended for production)
-- `base`: Better than tiny, still fast (requires ~5GB RAM)
-- `small`: Good balance of speed and accuracy - recommended for faster processing (requires ~6GB RAM)
-- `medium`: **Default** - Best balance of accuracy and speed for production use (requires ~9GB RAM)
-- `turbo`: Faster than large, good accuracy (requires ~10GB RAM)
-- `large-v3-turbo`: Latest optimized large model (requires ~13GB RAM)
-- `large`: Highest accuracy, significantly slower (requires ~15GB RAM)
+**Model Selection Guidance** (faster-whisper memory requirements):
+- `tiny`: Fastest, lowest accuracy - good for quick tests (~3GB total)
+- `base`: Better than tiny, still fast (~3GB total)
+- `small`: Good balance of speed and accuracy (~3.5GB total)
+- `medium`: **Default** - Best balance of accuracy and speed (~4.5GB total)
+- `turbo`: Fast with good accuracy (~4.5GB total)
+- `distil-large-v3`: Distilled large model, fast with near-large accuracy (~4GB total)
+- `large-v3-turbo`: Optimised large model (~5GB total)
+- `large-v3`: Highest accuracy (~5.5GB total)
 
 **Choosing Based on Available Memory**:
-- Less than 5GB available: Use `tiny` with `--auto-adjust`
-- 5-6GB available: Use `base` or `small`
-- 6-9GB available: Use `small` or `medium`
-- 9-13GB available: Use `medium` (default) or `turbo`
-- 13-15GB available: Use `large-v3-turbo`
-- 15GB+ available: Use `large` for maximum accuracy
+- Less than 4GB available: Use `tiny` with `--auto-adjust`
+- 4-5GB available: Use `base`, `small`, or `medium`
+- 5-6GB available: Use `medium`, `turbo`, or `distil-large-v3`
+- 6-7GB available: Use `large-v3-turbo`
+- 7GB+ available: Use `large-v3` for maximum accuracy
 
 **Pro tip**: Always use `--auto-adjust` when requesting larger models to ensure safe execution
 
@@ -718,11 +736,8 @@ git commit -m "updates"
 ## Current Limitations
 
 1. **Single File Processing**: No batch processing support - must run script multiple times for multiple files
-2. **Output Format**: Only plain text output. No support for structured formats (JSON, SRT, VTT) or speaker identification by name
-3. **PyAnnote Model**: Diarization model is hardcoded to `pyannote/speaker-diarisation-3.1` in source code
-4. **Audio Format Settings**: FFmpeg conversion parameters (16kHz, mono) are hardcoded and not configurable via CLI
-5. **No Package Structure**: All code in single script file - not installable as a Python package
-6. **Speaker Labels**: Speakers identified as generic labels (SPEAKER_00, SPEAKER_01) rather than by name
+2. **PyAnnote Model**: Diarisation model is hardcoded to `pyannote/speaker-diarisation-3.1` in source code
+3. **Audio Format Settings**: FFmpeg conversion parameters (16kHz, mono) are hardcoded and not configurable via CLI
 
 ## Development Conventions
 
@@ -734,7 +749,7 @@ git commit -m "updates"
 - **Error Handling**: Comprehensive try/except blocks with meaningful error messages
 - **Argument Parsing**: Uses `argparse` for CLI interface with help documentation
 - **Security**: HF_TOKEN stored in `.env` file (git-ignored), managed by `python-dotenv`
-- **Modular Design**: Transcription and diarisation logic in separate functions (though all in single file)
+- **Modular Design**: Core engine in `pipeline.py`, imported by CLI (`transcribe.py`), MCP server (`mcp_server.py`), and Gradio GUI
 - **Hugging Face Hub**: Pre-trained models downloaded and cached locally on first run
 - **Memory Management**: Large files processed in chunks; entire chunks read into memory to avoid seeking issues
 - **Resource Monitoring**: Pre-flight memory checks using `psutil` to prevent OOM crashes
