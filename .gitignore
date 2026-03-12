@@ -3,6 +3,9 @@
 *.env
 !.env.example
 
+# Docker build cache (models copied from ~/.cache/huggingface/hub/)
+hf_cache/
+
 # Python
 __pycache__/
 *.py[cod]
