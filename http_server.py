@@ -20,7 +20,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
 from read_secret import read_secret
@@ -47,12 +47,63 @@ def _ensure_pipeline():
 
     # Read HF_TOKEN from Docker secret or env var
     try:
-        hf_token = read_secret("hf_token", fallback_env="HF_TOKEN")
+        hf_token = read_secret("crucible_hf_token", fallback_env="HF_TOKEN")
         os.environ["HF_TOKEN"] = hf_token
     except RuntimeError:
         logger.warning("HF_TOKEN not found — diarisation will fail if models aren't cached")
 
     _pipeline_loaded = True
+
+
+def _format_segments_with_speakers(segments) -> str:
+    """Collapse a SpeakerSegment list into a diarised plain-text block.
+
+    Returns one line per speaker turn. Consecutive segments from the
+    same speaker are merged so the operator sees:
+
+        [Alice] Hi, are you alright?
+        [Bob] Yeah, good thanks. Good morning.
+        [Alice] It's gorgeous. Nice to be working.
+
+    Falls back to a plain-text concatenation when every segment is
+    "UNKNOWN" (i.e. skip_diarisation=True or pyannote wasn't run),
+    so voice notes still produce clean output without pointless
+    [UNKNOWN] labels.
+    """
+    cleaned = [s for s in segments if (s.text or "").strip()]
+    if not cleaned:
+        return ""
+
+    def _label(seg):
+        name = getattr(seg, "real_name", None)
+        if name:
+            return name
+        return getattr(seg, "speaker_label", None) or "UNKNOWN"
+
+    all_labels = {_label(s) for s in cleaned}
+    if all_labels <= {"UNKNOWN"}:
+        return " ".join(s.text.strip() for s in cleaned)
+
+    lines: list[str] = []
+    current_label: str | None = None
+    current_parts: list[str] = []
+
+    def _flush():
+        if current_label is not None and current_parts:
+            lines.append(f"[{current_label}] {' '.join(current_parts).strip()}")
+
+    for seg in cleaned:
+        label = _label(seg)
+        text = seg.text.strip()
+        if label == current_label:
+            current_parts.append(text)
+        else:
+            _flush()
+            current_label = label
+            current_parts = [text]
+    _flush()
+
+    return "\n".join(lines)
 
 
 @app.get("/health")
@@ -62,18 +113,15 @@ async def health():
 
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
+async def transcribe(
+    file: UploadFile = File(...),
+    skip_diarisation: bool = Form(False),
+):
     """Transcribe an uploaded audio file and return plain transcript text.
-
-    Optimised for short voice notes (< 2 minutes, single speaker).
-    Uses large-v3 for accuracy. Skips wav2vec2 alignment (not needed for
-    plain transcript output). WHISPER_MODEL env var can override.
-
-    Future: add option to skip diarisation entirely for single-speaker
-    voice notes — would reduce processing time significantly on CPU.
 
     Args:
         file: Audio file (multipart upload, field name "file")
+        skip_diarisation: If true, skip speaker diarisation (faster, no HF_TOKEN needed)
 
     Returns:
         {"transcript": "transcribed text here"}
@@ -81,11 +129,18 @@ async def transcribe(file: UploadFile = File(...)):
     _ensure_pipeline()
 
     hf_token = os.environ.get("HF_TOKEN", "")
-    if not hf_token:
+
+    # HF_TOKEN is only required when diarisation is enabled
+    if not skip_diarisation and not hf_token:
         return JSONResponse(
             status_code=500,
-            content={"error": "HF_TOKEN not configured"},
+            content={"error": "HF_TOKEN not configured and diarisation is enabled"},
         )
+
+    logger.info(
+        "Transcribing %s (skip_diarisation=%s)",
+        file.filename, skip_diarisation,
+    )
 
     # Write uploaded file to a temporary location
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
@@ -104,12 +159,24 @@ async def transcribe(file: UploadFile = File(...)):
             chunk_duration_seconds=300,  # Shorter chunks for voice notes
             use_alignment=False,         # Skip wav2vec2 for speed
             backend="faster-whisper",
+            skip_diarisation=skip_diarisation,
         )
 
-        # Concatenate all segments into a single transcript string
-        transcript = " ".join(
-            seg.text.strip() for seg in result.segments if seg.text.strip()
-        )
+        # Format segments with speaker labels preserved so the Crucible
+        # orchestrator delivers a properly diarised transcript to the
+        # operator. Previous behaviour flattened seg.text only, which
+        # silently dropped seg.speaker_label and produced a big unlabeled
+        # block (fix-49 field test 2026-04-11, Bug 7 triage).
+        #
+        # Output model:
+        # - skip_diarisation=True OR every segment is "UNKNOWN" →
+        #   plain concatenated text, no labels (voice notes, single-
+        #   speaker recordings)
+        # - Otherwise → one line per speaker turn, prefixed with
+        #   the mapped real_name if available else speaker_label.
+        #   Consecutive segments from the same speaker are merged
+        #   into a single turn rather than repeating the label.
+        transcript = _format_segments_with_speakers(result.segments)
 
         logger.info(
             "Transcribed %s: %d chars, %.1fs processing time",
