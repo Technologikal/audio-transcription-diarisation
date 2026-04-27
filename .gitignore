@@ -57,6 +57,7 @@ Thumbs.db
 *.wav
 *.mp3
 *.flac
+*.aac
 *.tar.gz
 *.zip
 
@@ -65,7 +66,9 @@ Thumbs.db
 *.docx
 *.pdf
 
-# Output files (transcription results)
+# Output files (transcription results — may contain PII / private meeting content)
 *_transcription.txt
+*_transcript.txt
+*_summary.txt
 transcription_output.txt
 output.txt

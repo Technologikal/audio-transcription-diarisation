@@ -819,6 +819,8 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                         # Build transcription params for faster-whisper
                         transcribe_kwargs = {
                             "word_timestamps": False,
+                            "condition_on_previous_text": False,
+                            "vad_filter": True,
                         }
                         if language:
                             transcribe_kwargs["language"] = language
@@ -859,8 +861,14 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     logger.debug(f"Transcribing full chunk {chunk_idx} with word-level timestamps")
 
                     # Build transcription params for faster-whisper
+                    # condition_on_previous_text=False prevents prompt-loop hallucination
+                    # where initial_prompt content gets echoed during silent regions.
+                    # vad_filter=True drops silence before decoding, eliminating the
+                    # silent-prefix attack surface entirely.
                     transcribe_kwargs = {
                         "word_timestamps": True,
+                        "condition_on_previous_text": False,
+                        "vad_filter": True,
                     }
                     if language:
                         transcribe_kwargs["language"] = language

@@ -527,6 +527,15 @@ The `transcribe_with_diarisation()` function processes long audio files in confi
 
 With `--legacy` mode, the original per-segment transcription is used instead (steps 2-5 revert to: diarise → slice per speaker → transcribe each segment independently).
 
+### Hallucination Mitigation
+
+Two faster-whisper transcribe parameters are hard-coded in `pipeline.py` to suppress prompt-leak / repetition hallucinations that the engine is prone to during silent or ambiguous audio:
+
+- **`condition_on_previous_text=False`** — prevents the decoder from feeding its previous emission back as context. Without this, an `initial_prompt` (e.g. agenda topics, speaker names) can be echoed during a silent intro and then reinforced window-by-window. Setting it `False` also gives a substantial speed-up (~35% on a 2-hour meeting at large-v3, beam_size=10) because the per-window attention footprint is smaller.
+- **`vad_filter=True`** — uses faster-whisper's built-in voice-activity-detection to drop silent regions before decoding. Saves a small amount of time and removes some of the silent-prefix surface area where prompt content can leak.
+
+These are applied in both the default full-chunk path and the `--legacy` per-segment path. Note: VAD is conservative and may keep ambient noise / chair-shuffle as "voice", so the VAD fix alone does not eliminate prompt leakage — the `condition_on_previous_text=False` pairing is the dominant fix.
+
 ### GPU Acceleration
 
 The pipeline automatically detects and uses CUDA if available:
