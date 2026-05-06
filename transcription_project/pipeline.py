@@ -519,7 +519,7 @@ def _refine_timestamps_with_wav2vec2(all_words, chunk_file, language, device):
 
 def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_seconds,
                                        whisper_model_name, language, compute_type,
-                                       initial_prompt, beam_size):
+                                       initial_prompt, beam_size, diarisation_kwargs=None):
     """
     Full WhisperX pipeline: transcribe + align + diarise in one pass.
 
@@ -577,7 +577,7 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
     # Step 3: Diarise
     logger.info("WhisperX: Running speaker diarisation")
     diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
-    diarize_segments = diarize_model(audio_path)
+    diarize_segments = diarize_model(audio_path, **(diarisation_kwargs or {}))
     result = whisperx.assign_word_speakers(diarize_segments, result)
     del diarize_model
     gc.collect()
@@ -625,7 +625,12 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                                  compute_type: Optional[str] = None,
                                  backend: str = "faster-whisper",
                                  use_alignment: bool = True,
-                                 skip_diarisation: bool = False) -> TranscriptionResult:
+                                 skip_diarisation: bool = False,
+                                 num_speakers: Optional[int] = None,
+                                 min_speakers: Optional[int] = None,
+                                 max_speakers: Optional[int] = None,
+                                 min_cluster_size: Optional[int] = None,
+                                 diarise_per_chunk: bool = False) -> TranscriptionResult:
     """
     Transcribes an audio file with speaker diarisation, processing in chunks.
 
@@ -656,6 +661,13 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
         skip_diarisation: If True, skip PyAnnote speaker diarisation entirely. All segments
             are labelled SPEAKER_00. Significantly faster on CPU — use for single-speaker
             audio like voice notes. Default: False.
+        num_speakers: Exact speaker count hint for PyAnnote. Overrides min/max if set.
+        min_speakers: Lower bound for speaker count.
+        max_speakers: Upper bound for speaker count.
+        min_cluster_size: Override PyAnnote's clustering min_cluster_size (default 12).
+            Lower values let short interjections survive instead of being merged.
+        diarise_per_chunk: If True, run diarisation independently on each chunk (legacy
+            behaviour). Default False — diarise the full file once for global clustering.
 
     Returns:
         TranscriptionResult with segments, lines, and optional agenda data
@@ -699,13 +711,26 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
         compute_type = "float16" if torch.cuda.is_available() else "int8"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Build diarisation kwargs once — used at every PyAnnote call site
+    diarisation_kwargs = {}
+    if num_speakers is not None:
+        diarisation_kwargs["num_speakers"] = num_speakers
+        logger.info(f"PyAnnote num_speakers hint: {num_speakers}")
+    else:
+        if min_speakers is not None:
+            diarisation_kwargs["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            diarisation_kwargs["max_speakers"] = max_speakers
+        if min_speakers is not None or max_speakers is not None:
+            logger.info(f"PyAnnote speaker bounds: min={min_speakers}, max={max_speakers}")
+
     # Use WhisperX backend if requested
     if backend == "whisperx":
         logger.info("Using WhisperX backend (full pipeline)")
         speaker_segments, transcription_lines, total_duration = _transcribe_with_whisperx_backend(
             audio_path, hf_token, chunk_duration_seconds,
             whisper_model_name, language, compute_type,
-            initial_prompt, beam_size,
+            initial_prompt, beam_size, diarisation_kwargs,
         )
     else:
         # Default: faster-whisper backend with manual PyAnnote diarisation
@@ -726,6 +751,18 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                 "pyannote/speaker-diarization-3.1",
                 use_auth_token=hf_token
             )
+
+            # Override clustering min_cluster_size if requested. Lower values
+            # prevent short interjections from being absorbed into larger clusters.
+            if min_cluster_size is not None:
+                try:
+                    diarisation_pipeline.clustering.min_cluster_size = min_cluster_size
+                    logger.info(f"PyAnnote min_cluster_size override: {min_cluster_size}")
+                except AttributeError:
+                    logger.warning(
+                        "Could not set clustering.min_cluster_size — "
+                        "PyAnnote pipeline structure may have changed"
+                    )
 
             # Send pipeline to GPU if available
             if torch.cuda.is_available():
@@ -753,6 +790,53 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
         except ValueError:
             logger.error(f"Could not parse audio duration from file: {audio_path}")
             raise RuntimeError(f"Could not parse audio duration from file: {audio_path}")
+
+        # Run global diarisation on the full file (default) instead of per chunk.
+        # Per-chunk clustering can't see speakers who appear in other chunks, and
+        # clusters below min_cluster_size get absorbed — so short interjections
+        # end up merged into the wrong speaker. Global diarisation fixes both.
+        # Skipped if --diarise-per-chunk, --legacy, or --skip-diarisation.
+        full_diar_segments = None
+        temp_full_path = None
+        global_diarisation = (
+            not skip_diarisation and not legacy_mode and not diarise_per_chunk
+        )
+        if global_diarisation:
+            temp_full_path = "temp_full_diarise.wav"
+            full_ffmpeg_cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ac", "1", "-ar", "16000",
+            ]
+            full_filters = []
+            if denoise_audio:
+                full_filters.append("afftdn=nf=-25")
+            if normalise_audio:
+                full_filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+            if full_filters:
+                full_ffmpeg_cmd.extend(["-af", ",".join(full_filters)])
+            full_ffmpeg_cmd.append(temp_full_path)
+
+            logger.info("Preprocessing full audio for global diarisation")
+            try:
+                subprocess.run(full_ffmpeg_cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"ffmpeg full-file preprocess failed: {e.stderr.decode('utf-8')}")
+                raise RuntimeError("ffmpeg full-file preprocess failed")
+
+            logger.info("Running speaker diarisation on full file (global clustering)")
+            diar_start = time.time()
+            full_diarisation = diarisation_pipeline(temp_full_path, **diarisation_kwargs)
+            full_diar_segments = list(full_diarisation.itertracks(yield_label=True))
+            unique_speakers = {label for _, _, label in full_diar_segments}
+            logger.info(
+                f"Global diarisation: {len(full_diar_segments)} segments, "
+                f"{len(unique_speakers)} unique speakers, "
+                f"{time.time() - diar_start:.1f}s"
+            )
+
+        # Words accumulated across all chunks with absolute timestamps —
+        # used for global diarisation assignment after the chunk loop.
+        global_words = []
 
         # Process in chunks
         num_chunks = math.ceil(total_duration / chunk_duration_seconds)
@@ -800,7 +884,7 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                 if legacy_mode:
                     # Legacy mode: transcribe each speaker segment independently
                     logger.debug(f"Running speaker diarisation on chunk {chunk_idx} (legacy mode)")
-                    diarisation = diarisation_pipeline(chunk_file)
+                    diarisation = diarisation_pipeline(chunk_file, **diarisation_kwargs)
 
                     info = sf.info(chunk_file)
                     sample_rate = info.samplerate
@@ -923,21 +1007,38 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                             )]
                         else:
                             chunk_speaker_segments = []
+                        # Append per-chunk for skip_diarisation
+                        for seg_obj in chunk_speaker_segments:
+                            line = f"Speaker {seg_obj.speaker_label} ({seg_obj.start_time:.2f}s - {seg_obj.end_time:.2f}s): {seg_obj.text}"
+                            transcription_lines.append(line)
+                            speaker_segments.append(seg_obj)
+                        logger.debug(f"Produced {len(chunk_speaker_segments)} segments for chunk {chunk_idx}")
+                    elif global_diarisation:
+                        # Global mode: accumulate words with absolute timestamps;
+                        # speaker assignment happens after the chunk loop.
+                        for w in all_words:
+                            global_words.append({
+                                "word": w["word"],
+                                "start": w["start"] + start_time,
+                                "end": w["end"] + start_time,
+                            })
+                        logger.debug(
+                            f"Chunk {chunk_idx}: collected {len(all_words)} words "
+                            f"(global total: {len(global_words)})"
+                        )
                     else:
-                        # Step 2: Run speaker diarisation
+                        # Per-chunk diarisation (--diarise-per-chunk path)
                         logger.debug(f"Running speaker diarisation on chunk {chunk_idx}")
-                        diarisation = diarisation_pipeline(chunk_file)
+                        diarisation = diarisation_pipeline(chunk_file, **diarisation_kwargs)
 
                         diar_segments = list(diarisation.itertracks(yield_label=True))
                         logger.debug(f"Found {len(diar_segments)} diarisation segments in chunk {chunk_idx}")
 
-                        # Step 3: Align words to speakers and group into SpeakerSegments
                         if all_words and diar_segments:
                             chunk_speaker_segments = assign_and_group_words(
                                 all_words, diar_segments, start_time, max_gap=2.0
                             )
                         elif all_words:
-                            # No diarisation segments — assign all words to UNKNOWN
                             text = "".join(w["word"] for w in all_words).strip()
                             chunk_speaker_segments = [SpeakerSegment(
                                 speaker_label="UNKNOWN",
@@ -948,18 +1049,49 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                         else:
                             chunk_speaker_segments = []
 
-                    # Step 4: Append results
-                    for seg_obj in chunk_speaker_segments:
-                        line = f"Speaker {seg_obj.speaker_label} ({seg_obj.start_time:.2f}s - {seg_obj.end_time:.2f}s): {seg_obj.text}"
-                        transcription_lines.append(line)
-                        speaker_segments.append(seg_obj)
+                        for seg_obj in chunk_speaker_segments:
+                            line = f"Speaker {seg_obj.speaker_label} ({seg_obj.start_time:.2f}s - {seg_obj.end_time:.2f}s): {seg_obj.text}"
+                            transcription_lines.append(line)
+                            speaker_segments.append(seg_obj)
 
-                    logger.debug(f"Produced {len(chunk_speaker_segments)} aligned speaker segments for chunk {chunk_idx}")
+                        logger.debug(f"Produced {len(chunk_speaker_segments)} aligned speaker segments for chunk {chunk_idx}")
 
             finally:
                 # Clean up the temporary chunk file
                 if os.path.exists(chunk_file):
                     os.remove(chunk_file)
+
+        # Post-loop: assign accumulated global words to global diarisation segments.
+        if global_diarisation:
+            try:
+                if global_words and full_diar_segments:
+                    logger.info(
+                        f"Aligning {len(global_words)} words to "
+                        f"{len(full_diar_segments)} global diarisation segments"
+                    )
+                    final_segments = assign_and_group_words(
+                        global_words, full_diar_segments, 0, max_gap=2.0
+                    )
+                elif global_words:
+                    text = "".join(w["word"] for w in global_words).strip()
+                    final_segments = [SpeakerSegment(
+                        speaker_label="UNKNOWN",
+                        start_time=global_words[0]["start"],
+                        end_time=global_words[-1]["end"],
+                        text=text
+                    )]
+                else:
+                    final_segments = []
+
+                for seg_obj in final_segments:
+                    line = f"Speaker {seg_obj.speaker_label} ({seg_obj.start_time:.2f}s - {seg_obj.end_time:.2f}s): {seg_obj.text}"
+                    transcription_lines.append(line)
+                    speaker_segments.append(seg_obj)
+
+                logger.info(f"Global assignment produced {len(final_segments)} speaker segments")
+            finally:
+                if temp_full_path and os.path.exists(temp_full_path):
+                    os.remove(temp_full_path)
 
     # Build result
     elapsed_time = time.time() - start_time_total

@@ -201,6 +201,35 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip wav2vec2 timestamp alignment (use faster-whisper's native word timestamps instead). Faster but slightly less precise word boundaries."
     )
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=None,
+        help="Exact number of speakers in the recording. Hint passed to PyAnnote diarisation — useful when speakers are acoustically similar. Overrides --min-speakers/--max-speakers."
+    )
+    parser.add_argument(
+        "--min-speakers",
+        type=int,
+        default=None,
+        help="Lower bound on speaker count for PyAnnote diarisation."
+    )
+    parser.add_argument(
+        "--max-speakers",
+        type=int,
+        default=None,
+        help="Upper bound on speaker count for PyAnnote diarisation."
+    )
+    parser.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=None,
+        help="Override PyAnnote's clustering min_cluster_size (default 12). Lower values (e.g. 6) help short interjections survive instead of being merged into similar-sounding clusters."
+    )
+    parser.add_argument(
+        "--diarise-per-chunk",
+        action="store_true",
+        help="Diarise each 10-min chunk independently (legacy behaviour). Default runs diarisation once on the full file for global clustering — fixes per-chunk speaker-merging at no time cost."
+    )
 
     args = parser.parse_args()
 
@@ -297,6 +326,11 @@ if __name__ == "__main__":
         compute_type=args.compute_type,
         backend=args.backend,
         use_alignment=not args.no_align,
+        num_speakers=args.num_speakers,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
+        min_cluster_size=args.min_cluster_size,
+        diarise_per_chunk=args.diarise_per_chunk,
     )
 
     # Handle output
