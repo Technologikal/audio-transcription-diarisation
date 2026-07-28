@@ -201,6 +201,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip wav2vec2 timestamp alignment (use faster-whisper's native word timestamps instead). Faster but slightly less precise word boundaries."
     )
+    parser.add_argument(
+        "--skip-diarisation",
+        action="store_true",
+        help="Skip speaker diarisation entirely (single-speaker recordings). Faster and uses less memory."
+    )
 
     args = parser.parse_args()
 
@@ -229,7 +234,8 @@ if __name__ == "__main__":
     # Check memory requirements before proceeding
     can_proceed, recommended_model, warning_msg = check_memory_requirements(
         args.model,
-        auto_adjust=args.auto_adjust
+        auto_adjust=args.auto_adjust,
+        skip_diarisation=args.skip_diarisation,
     )
 
     if not can_proceed:
@@ -297,6 +303,7 @@ if __name__ == "__main__":
         compute_type=args.compute_type,
         backend=args.backend,
         use_alignment=not args.no_align,
+        skip_diarisation=args.skip_diarisation,
     )
 
     # Handle output

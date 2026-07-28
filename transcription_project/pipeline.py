@@ -159,7 +159,7 @@ def get_system_resources():
     return resources
 
 
-def check_memory_requirements(whisper_model_name, auto_adjust=False):
+def check_memory_requirements(whisper_model_name, auto_adjust=False, skip_diarisation=False):
     """
     Check if system has enough memory to run the models.
 
@@ -171,7 +171,8 @@ def check_memory_requirements(whisper_model_name, auto_adjust=False):
         tuple: (can_proceed, recommended_model, warning_message)
     """
     resources = get_system_resources()
-    required_memory = WHISPER_MODEL_MEMORY.get(whisper_model_name, 5.0) + PYANNOTE_MEMORY
+    pyannote_mem = 0.0 if skip_diarisation else PYANNOTE_MEMORY
+    required_memory = WHISPER_MODEL_MEMORY.get(whisper_model_name, 5.0) + pyannote_mem
 
     # Determine which memory pool to check (GPU VRAM or CPU RAM)
     if resources['has_cuda'] and resources['available_vram_gb'] is not None:
@@ -186,7 +187,8 @@ def check_memory_requirements(whisper_model_name, auto_adjust=False):
     # Log current resource status
     logger.info(f"System resources: {available_memory:.2f} GB available {memory_type} "
                 f"({total_memory:.2f} GB total, {resources['ram_usage_percent']:.1f}% in use)")
-    logger.info(f"Required memory for {whisper_model_name} model + PyAnnote: ~{required_memory:.1f} GB")
+    label = f"{whisper_model_name} model" + ("" if skip_diarisation else " + PyAnnote")
+    logger.info(f"Required memory for {label}: ~{required_memory:.1f} GB")
 
     # Add safety margin (20% buffer)
     safety_margin = 1.2
@@ -625,7 +627,8 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                                  denoise_audio: bool = False,
                                  compute_type: Optional[str] = None,
                                  backend: str = "faster-whisper",
-                                 use_alignment: bool = True) -> TranscriptionResult:
+                                 use_alignment: bool = True,
+                                 skip_diarisation: bool = False) -> TranscriptionResult:
     """
     Transcribes an audio file with speaker diarisation, processing in chunks.
 
@@ -714,16 +717,20 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
             compute_type=compute_type,
         )
 
-        logger.info("Loading PyAnnote speaker diarisation pipeline")
-        diarisation_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token
-        )
+        if skip_diarisation:
+            diarisation_pipeline = None
+            logger.info("Skipping speaker diarisation (single-speaker mode)")
+        else:
+            logger.info("Loading PyAnnote speaker diarisation pipeline")
+            diarisation_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=hf_token
+            )
 
-        # Send pipeline to GPU if available
-        if torch.cuda.is_available():
-            diarisation_pipeline.to(torch.device("cuda"))
-            logger.info("Using GPU acceleration (CUDA)")
+            # Send pipeline to GPU if available
+            if torch.cuda.is_available():
+                diarisation_pipeline.to(torch.device("cuda"))
+                logger.info("Using GPU acceleration (CUDA)")
 
         # Get audio duration using ffprobe
         probe_cmd = [
@@ -896,12 +903,14 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                             all_words, chunk_file, language, device
                         )
 
-                    # Step 2: Run speaker diarisation
-                    logger.debug(f"Running speaker diarisation on chunk {chunk_idx}")
-                    diarisation = diarisation_pipeline(chunk_file)
-
-                    diar_segments = list(diarisation.itertracks(yield_label=True))
-                    logger.debug(f"Found {len(diar_segments)} diarisation segments in chunk {chunk_idx}")
+                    # Step 2: Run speaker diarisation (skip if single-speaker mode)
+                    if skip_diarisation:
+                        diar_segments = []
+                    else:
+                        logger.debug(f"Running speaker diarisation on chunk {chunk_idx}")
+                        diarisation = diarisation_pipeline(chunk_file)
+                        diar_segments = list(diarisation.itertracks(yield_label=True))
+                        logger.debug(f"Found {len(diar_segments)} diarisation segments in chunk {chunk_idx}")
 
                     # Step 3: Align words to speakers and group into SpeakerSegments
                     if all_words and diar_segments:
