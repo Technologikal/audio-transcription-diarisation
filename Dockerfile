@@ -43,6 +43,7 @@ COPY transcription_project/ /app/
 
 # Copy Crucible integration files
 COPY server.py /app/server.py
+COPY http_server.py /app/http_server.py
 COPY read_secret.py /app/read_secret.py
 
 # Default to HTTP mode (Zone 3 pre-processing for voice notes)
