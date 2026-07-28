@@ -27,6 +27,12 @@ warnings.filterwarnings("ignore", message=".*In 2.9.*torchcodec.*")
 import torch
 import numpy as np
 
+# #93: subtitle-credit hallucination filter (dependency-free sibling module).
+from hallucination_filter import (
+    is_subtitle_credit_hallucination,
+    filter_hallucination_segments,
+)
+
 # PyAnnote 3.x model checkpoints contain many custom types (Specifications,
 # Problem, Powerset, Resolution, etc.) that torch.load won't deserialise with
 # PyTorch 2.6+'s weights_only=True default. Rather than chasing each type,
@@ -903,6 +909,13 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                         # Build transcription params for faster-whisper
                         transcribe_kwargs = {
                             "word_timestamps": False,
+                            # Layered hallucination mitigation, from two
+                            # independently-developed fixes kept together:
+                            #  - condition_on_previous_text=False stops Whisper
+                            #    drifting from one hallucinated phrase into
+                            #    fabricated follow-on sentences (#93).
+                            #  - vad_filter=True drops silence before decoding,
+                            #    removing the conditions that trigger it at all.
                             "condition_on_previous_text": False,
                             "vad_filter": True,
                         }
@@ -922,7 +935,9 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                             transcribe_kwargs["no_speech_threshold"] = no_speech_threshold
 
                         seg_result, _ = whisper_model.transcribe(segment_audio_data, **transcribe_kwargs)
-                        transcription = " ".join(seg.text for seg in seg_result).strip()
+                        # #93: drop subtitle-credit hallucination segments before joining.
+                        _kept, _ = filter_hallucination_segments(seg.text for seg in seg_result)
+                        transcription = " ".join(_kept).strip()
 
                         original_start = start_time + turn.start
                         original_end = start_time + turn.end
@@ -951,6 +966,9 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     # silent-prefix attack surface entirely.
                     transcribe_kwargs = {
                         "word_timestamps": True,
+                        # See the note above: prompt-loop drift is prevented by
+                        # condition_on_previous_text=False, and the silent-prefix
+                        # attack surface removed by vad_filter=True.
                         "condition_on_previous_text": False,
                         "vad_filter": True,
                     }
@@ -978,6 +996,13 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     # for compatibility with assign_and_group_words)
                     all_words = []
                     for segment in segments_gen:
+                        # #93: skip subtitle-credit hallucination segments entirely.
+                        if is_subtitle_credit_hallucination(segment.text):
+                            logger.warning(
+                                "Dropped Whisper subtitle-credit hallucination (#93): %r",
+                                segment.text.strip(),
+                            )
+                            continue
                         if segment.words:
                             for word in segment.words:
                                 all_words.append({
