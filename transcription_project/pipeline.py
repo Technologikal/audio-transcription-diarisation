@@ -457,7 +457,8 @@ def fill_none_speakers(assigned_words):
     return filled
 
 
-def assign_and_group_words(all_words, diarisation_segments, chunk_start_time, max_gap=2.0):
+def assign_and_group_words(all_words, diarisation_segments, chunk_start_time,
+                           max_gap=2.0, progress=None):
     """
     Assign Whisper words to PyAnnote speakers and group into SpeakerSegments.
 
@@ -470,6 +471,14 @@ def assign_and_group_words(all_words, diarisation_segments, chunk_start_time, ma
         diarisation_segments: List of (turn, _, speaker) tuples from PyAnnote
         chunk_start_time: Start time of this chunk in the original audio (seconds)
         max_gap: Maximum gap in seconds between words before starting a new segment
+        progress: Optional _ProgressReporter. The assignment loop below is
+            O(words x diarisation_segments) — on a long recording that is
+            every word in hours of audio scanned against every speaker turn,
+            and in global mode it runs ONCE at the end over the whole file
+            rather than per chunk. Left uninstrumented it is a silent tail:
+            the marker's last movement would be the "assemble" emit before
+            this call, and a watchdog would read the wait as a stall on work
+            that is finishing normally. Omit it and behaviour is unchanged.
 
     Returns:
         List[SpeakerSegment] with absolute timestamps
@@ -479,7 +488,16 @@ def assign_and_group_words(all_words, diarisation_segments, chunk_start_time, ma
 
     # Assign each word to a speaker
     assigned = []
-    for word in all_words:
+    for idx, word in enumerate(all_words):
+        # Checked every 500 words rather than every word: the reporter
+        # rate-limits emission anyway, and this keeps the hot loop free of a
+        # per-word call. 500 words is a few seconds of speech, so the marker
+        # still moves far more often than any threshold cares about.
+        if progress is not None and idx % 500 == 0:
+            progress.emit(
+                "assemble",
+                audio_seconds_done=chunk_start_time + word["start"],
+            )
         midpoint = (word["start"] + word["end"]) / 2
         speaker = find_speaker_at_time(
             midpoint, diarisation_segments,
@@ -1351,7 +1369,8 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
 
                         if all_words and diar_segments:
                             chunk_speaker_segments = assign_and_group_words(
-                                all_words, diar_segments, start_time, max_gap=2.0
+                                all_words, diar_segments, start_time, max_gap=2.0,
+                                progress=progress,
                             )
                         elif all_words:
                             text = "".join(w["word"] for w in all_words).strip()
@@ -1385,8 +1404,13 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                         f"Aligning {len(global_words)} words to "
                         f"{len(full_diar_segments)} global diarisation segments"
                     )
+                    # The global case is the one that matters: this runs ONCE
+                    # over every word in the whole recording, after the chunk
+                    # loop has finished, so nothing else is emitting markers
+                    # while it works.
                     final_segments = assign_and_group_words(
-                        global_words, full_diar_segments, 0, max_gap=2.0
+                        global_words, full_diar_segments, 0, max_gap=2.0,
+                        progress=progress,
                     )
                 elif global_words:
                     text = "".join(w["word"] for w in global_words).strip()
