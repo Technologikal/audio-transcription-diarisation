@@ -66,6 +66,10 @@ Thumbs.db
 *.pdf
 
 # Output files (transcription results)
+# NOTE: *_transcription.txt does NOT match the *_transcript.txt files the
+# pipeline actually writes — both patterns are needed (027/US5 T006).
 *_transcription.txt
+*_transcript.txt
+*_summary.md
 transcription_output.txt
 output.txt
