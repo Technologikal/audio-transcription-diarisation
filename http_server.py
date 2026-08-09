@@ -71,10 +71,10 @@ def _format_segments_with_speakers(segments) -> str:
         [Bob] Yeah, good thanks. Good morning.
         [Alice] It's gorgeous. Nice to be working.
 
-    Falls back to a plain-text concatenation when every segment is
-    "UNKNOWN" (i.e. skip_diarisation=True or pyannote wasn't run),
-    so voice notes still produce clean output without pointless
-    [UNKNOWN] labels.
+    Falls back to a plain-text concatenation whenever the whole recording
+    resolves to a single speaker — skip_diarisation=True (every segment
+    "SPEAKER_00"), pyannote not run ("UNKNOWN"), or a real diarisation run
+    that found one voice. Labelling a monologue adds nothing.
     """
     cleaned = [s for s in segments if (s.text or "").strip()]
     if not cleaned:
@@ -87,7 +87,11 @@ def _format_segments_with_speakers(segments) -> str:
         return getattr(seg, "speaker_label", None) or "UNKNOWN"
 
     all_labels = {_label(s) for s in cleaned}
-    if all_labels <= {"UNKNOWN"}:
+    # Single-speaker output carries no useful label, whatever that speaker is
+    # called. Test the COUNT, not a magic name: skip_diarisation labels every
+    # segment "SPEAKER_00", other paths use "UNKNOWN", and a genuine diarisation
+    # run that finds one speaker should also come back as plain text.
+    if len(all_labels) <= 1:
         return " ".join(s.text.strip() for s in cleaned)
 
     lines: list[str] = []
