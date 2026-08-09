@@ -18,7 +18,9 @@ This becomes negligible with GPU (e.g. RTX 3060 upgrade).
 
 import logging
 import os
+import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile
@@ -38,6 +40,19 @@ app = FastAPI(title="voice-transcription", version="1.0.0")
 
 # Lazy-loaded pipeline components (loaded on first request to keep startup fast)
 _pipeline_loaded = False
+
+# One transcription at a time.
+#
+# While `transcribe` was `async def` this was implicit: the synchronous
+# pipeline occupied the event loop, so a second request could not even be
+# dispatched until the first returned. Moving the handler to the threadpool
+# frees the loop — and would, without this lock, let the threadpool run
+# several CPU-bound transcriptions at once on a machine sized for one.
+#
+# A blocking acquire, not a 429: it preserves exactly what a caller saw
+# before (a second request waits, then runs), while the event loop stays
+# free to answer /health, status and cancel throughout.
+_transcription_lock = threading.Lock()
 
 
 def _ensure_pipeline():
@@ -123,11 +138,23 @@ async def health():
 
 
 @app.post("/transcribe")
-async def transcribe(
+def transcribe(
     file: UploadFile = File(...),
     skip_diarisation: bool = Form(False),
 ):
     """Transcribe an uploaded audio file and return plain transcript text.
+
+    Declared `def`, not `async def`, deliberately. The pipeline below is
+    synchronous and CPU-bound for minutes to hours. On an `async def`
+    handler it runs *on* the single uvicorn event loop, so the server can
+    answer nothing at all — not `/health`, not a status query, not a
+    cancellation — for the whole duration of a transcription. As a plain
+    `def`, FastAPI offloads it to its threadpool and the loop stays free.
+
+    That is why `/health` used to flip to unhealthy about 90 seconds into
+    every *successful* job: the healthcheck was measuring event-loop
+    availability, not service health, and could never have indicated a
+    genuine hang.
 
     Args:
         file: Audio file (multipart upload, field name "file")
@@ -154,23 +181,27 @@ async def transcribe(
 
     # Write uploaded file to a temporary location
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
+    # `file.file` is the underlying spooled file object — the synchronous
+    # read that pairs with a synchronous handler. `await file.read()` is
+    # unavailable here and would need the handler back on the event loop.
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(await file.read())
+        shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
     try:
         from pipeline import transcribe_with_diarisation
 
-        result = transcribe_with_diarisation(
-            audio_path=tmp_path,
-            hf_token=hf_token,
-            whisper_model_name=os.environ.get("WHISPER_MODEL", "large-v3"),
-            language="english",
-            chunk_duration_seconds=300,  # Shorter chunks for voice notes
-            use_alignment=False,         # Skip wav2vec2 for speed
-            backend="faster-whisper",
-            skip_diarisation=skip_diarisation,
-        )
+        with _transcription_lock:
+            result = transcribe_with_diarisation(
+                audio_path=tmp_path,
+                hf_token=hf_token,
+                whisper_model_name=os.environ.get("WHISPER_MODEL", "large-v3"),
+                language="english",
+                chunk_duration_seconds=300,  # Shorter chunks for voice notes
+                use_alignment=False,         # Skip wav2vec2 for speed
+                backend="faster-whisper",
+                skip_diarisation=skip_diarisation,
+            )
 
         # Format segments with speaker labels preserved so callers receive a
         # properly diarised transcript rather than an unlabelled block.
