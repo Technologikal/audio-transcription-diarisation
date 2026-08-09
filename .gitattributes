@@ -1,0 +1,7 @@
+# Normalise line endings so Windows edits stop producing phantom whole-file diffs.
+# (A CRLF-only commit previously read as "113 lines changed" in Dockerfile.)
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.wav binary
+*.m4a binary
