@@ -1,7 +1,7 @@
 # Integration Contract: audio-transcription-diarisation
 
-**Version**: 1.0.0
-**Last updated**: 2026-03-12
+**Version**: 1.1.0
+**Last updated**: 2026-08-09
 
 This document declares the stable interfaces that Crucible depends on.
 Changes to these interfaces follow the breaking change policy below.
@@ -20,9 +20,18 @@ Accepts a multipart file upload and returns a plain transcript.
 
 - **Content-Type**: `multipart/form-data`
 - **Field name**: `file` (audio bytes — m4a, ogg, wav, mp3, flac, etc.)
+- **Optional field**: `job_id` (string) — *added 1.1.0.* An opaque identifier
+  chosen by the caller. Supply it and the run becomes observable and stoppable
+  through the two endpoints below. Omit it and the run reports nothing, which
+  is exactly the pre-1.1.0 behaviour. No format is imposed and none should be:
+  the identifier means nothing to this service.
 - **Success response** (200):
   ```json
   {"transcript": "transcribed text here"}
+  ```
+- **Cancelled response** (409) — *added 1.1.0*:
+  ```json
+  {"error": "transcription cancelled", "cancelled": true}
   ```
 - **Error response** (500):
   ```json
@@ -33,6 +42,58 @@ Accepts a multipart file upload and returns a plain transcript.
   - Language forced to English (single-speaker voice note assumption)
   - Diarisation runs but output is concatenated into a single string
   - wav2vec2 alignment skipped for speed
+  - **One transcription at a time.** A second request blocks until the first
+    finishes, as it always has — before 1.1.0 that was an accident of the
+    handler occupying the event loop; it is now explicit.
+  - **Runs in a worker child process** (1.1.0). The service itself never exits
+    to stop a job, so it needs no external supervisor to survive a
+    cancellation.
+
+#### `GET /transcribe/{job_id}/status`
+
+*Added 1.1.0.* Reports how far the job currently running has got.
+
+- **Success response** (200) — fields after `state` are **omitted until the
+  first stage boundary is reached**, because "has not reported yet" and
+  "reported an unknown value" are different claims:
+  ```json
+  {
+    "job_id": "…", "state": "running",
+    "marker_seq": 14, "phase": "diarise",
+    "chunk_index": 5, "chunk_total": 18,
+    "audio_seconds_done": 1500.0, "audio_total_seconds": 5400.0
+  }
+  ```
+- **Not-this-job response** (404): `{"error": "not running here"}`. The service
+  is single-worker and answers only about the job in flight. A 404 means the
+  job is finished, never started, or lost — **on its own it is not evidence of
+  failure**, and this endpoint does not guess which.
+- `marker_seq` is monotonic. Its value carries no meaning; only that it
+  *changes* does. A caller watching for a stall reads "has it moved", never
+  "how far has it got".
+- `phase` is one of `extract`, `transcribe`, `diarise`, `assemble`.
+- `audio_seconds_done` is **absent during global diarisation**, which is one
+  pass over the whole file with no position within the recording. Reporting
+  zero there would read as 0% progress on a job that is ~61% through its work.
+- **No transcript content.** Position and stage only — status is not an egress
+  path for recorded material.
+- No client state and no schedule: the caller polls at whatever cadence suits
+  it.
+
+#### `POST /transcribe/{job_id}/cancel`
+
+*Added 1.1.0.* Asks the running job to stop.
+
+- **Success response** (202): `{"status": "cancelling", "job_id": "…"}` —
+  returned **immediately**, never blocking on the worker.
+- **Not-this-job response** (404): `{"error": "not running here"}`. A caller
+  whose goal is "that work is not running" may treat this as success.
+- Idempotent: repeat requests are accepted and logged.
+- **Behaviour**: the worker stops at its next stage boundary and unwinds
+  cleanly, removing its temporary files. If it is wedged and never reaches a
+  boundary, its process group is signalled and then killed once
+  `TRANSCRIPTION_CANCEL_GRACE_SECONDS` (default 90) has elapsed. The service
+  stays up throughout and serves the next request with a fresh child.
 
 #### `GET /health`
 
@@ -40,6 +101,10 @@ Accepts a multipart file upload and returns a plain transcript.
   ```json
   {"status": "ok"}
   ```
+- *Since 1.1.0 this answers **during** a transcription.* Before, the pipeline
+  occupied the single event loop, so the endpoint could not respond while the
+  service was working — it reported unhealthy roughly 90 seconds into every
+  successful job and could never have indicated a genuine hang.
 
 ### MCP Tools (Zone 5a — on-demand transcription)
 
@@ -131,9 +196,29 @@ bump requires updating Crucible's `tools/voice-transcription/manifest.json` and
 
 | Secret | Mount path | Purpose |
 |--------|-----------|---------|
-| `hf_token` | `/run/secrets/hf_token` | HuggingFace API token for PyAnnote model access |
+| `hf_token` | `/run/secrets/$HF_TOKEN_SECRET` | HuggingFace API token for PyAnnote model access |
 
 Fallback: `HF_TOKEN` environment variable (for local development only).
+
+**The secret's name is configuration**, not a fixed string. The service reads
+`/run/secrets/$HF_TOKEN_SECRET`, defaulting to the plain name `hf_token` so it
+runs standalone with no deployment-specific setup. A deployment that mounts it
+under a namespaced name **must** set `HF_TOKEN_SECRET` to match.
+
+> Getting this wrong fails in a way that is easy to miss: the service starts
+> healthy, and only *diarised* requests fail (`HTTP 500 — HF_TOKEN not
+> configured`). Requests passing `skip_diarisation=true` need no token and keep
+> working, so a smoke test using one will report the service as fine. Crucible
+> shipped exactly this fault on 2026-08-09 and it survived a merge review.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SERVER_MODE` | — | `http` or `mcp` |
+| `WHISPER_MODEL` | `large-v3` | faster-whisper model name |
+| `HF_TOKEN_SECRET` | `hf_token` | Name of the mounted HF token secret |
+| `TRANSCRIPTION_CANCEL_GRACE_SECONDS` | `90` | *Added 1.1.0.* How long a cancelled worker is given to unwind before its process group is killed |
 
 At **build time**, `HF_TOKEN` is required as a `--build-arg` to bake PyAnnote models
 into the Docker image. At **runtime**, it is only needed if models aren't cached in
@@ -150,8 +235,24 @@ the image (which shouldn't happen with a properly built image).
 | CPU | Any x86_64 | Multi-core for faster chunked processing |
 | GPU | Not required | CUDA-capable GPU significantly speeds up processing |
 
-Processing time (CPU, large-v3 model): approximately 2-3x real-time audio duration.
-With GPU: near real-time.
+Processing time (CPU, large-v3 model): **approximately 1.05x real-time audio
+duration** — measured 2026-08-09 on a 20-minute multi-speaker slice (1263s
+wallclock for 1200s of audio) and corroborated by a 3-minute slice (172.6s for
+180s). The earlier "2-3x" figure in this document was an estimate, never a
+measurement.
+
+The split matters more than the total, because it is wildly uneven:
+
+| Phase | Share of runtime |
+|-------|------------------|
+| Global diarisation — **one pass, before the chunk loop** | **~61%** |
+| Chunked transcription | ~37% |
+
+A three-hour recording therefore spends roughly **two hours inside a single
+diarisation call**. Any caller timing out, or watching for progress, has to
+accommodate that phase specifically.
+
+With GPU: substantially faster; not measured here.
 
 ---
 
