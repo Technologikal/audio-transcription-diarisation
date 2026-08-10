@@ -269,10 +269,36 @@ def _kill_worker(proc, reason):
     """
     if proc.pid is None or not proc.is_alive():
         return
+
+    # Only signal the process GROUP when the worker genuinely has one of its
+    # own — that is, when its setsid() succeeded and made it the leader.
+    #
+    # This guard is the difference between cancelling a job and killing the
+    # service. The child calls setsid() under a try/except; if that ever
+    # failed it would remain in THIS process's group, and killpg would then
+    # take down the service and every sibling with it. That is precisely the
+    # outcome the child-process design exists to prevent — a cancellation
+    # must never require the service to die.
+    #
+    # The window is narrow (setsid does not normally fail after a fork) and
+    # the consequence is total, which is exactly when a cheap check earns its
+    # place. Falling back to terminating the single process leaves the
+    # worker's ffmpeg children to be reaped by init rather than orphaning
+    # them indefinitely; a leaked helper is recoverable, a dead service is
+    # not.
+    pgid = None
     try:
-        pgid = os.getpgid(proc.pid)
+        child_pgid = os.getpgid(proc.pid)
+        if child_pgid == proc.pid and child_pgid != os.getpgid(0):
+            pgid = child_pgid
+        else:
+            logger.warning(
+                "Worker %s is not its own process group leader (pgid=%s); "
+                "signalling the process alone so the service is not caught in "
+                "the blast radius", proc.pid, child_pgid,
+            )
     except OSError:
-        pgid = None
+        pass
 
     logger.warning("Terminating worker %s: %s", proc.pid, reason)
     try:
