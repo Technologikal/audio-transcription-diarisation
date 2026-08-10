@@ -1,7 +1,7 @@
 # Integration Contract: audio-transcription-diarisation
 
-**Version**: 1.1.0
-**Last updated**: 2026-08-09
+**Version**: 1.2.0
+**Last updated**: 2026-08-10
 
 This document declares the stable interfaces that Crucible depends on.
 Changes to these interfaces follow the breaking change policy below.
@@ -25,10 +25,29 @@ Accepts a multipart file upload and returns a plain transcript.
   through the two endpoints below. Omit it and the run reports nothing, which
   is exactly the pre-1.1.0 behaviour. No format is imposed and none should be:
   the identifier means nothing to this service.
-- **Success response** (200):
+- **Optional field**: `model` (string) — *added 1.2.0.* Whisper model for this
+  request, overriding the service default. Different callers hold different
+  material: a dictated note read back within minutes tolerates a faster,
+  looser model; a recording that will be filed and searched for years does
+  not. Only the caller knows which it has. Omit it for the configured
+  default.
+
+  The model must already be available to the service. A deployment with no
+  outbound network cannot fetch one on demand, so an unknown name fails at
+  load time rather than downloading.
+- **Success response** (200) — *`model`, `backend` and `diarised` added
+  1.2.0; purely additive, existing callers can ignore them*:
   ```json
-  {"transcript": "transcribed text here"}
+  {
+    "transcript": "transcribed text here",
+    "model": "large-v3-turbo",
+    "backend": "faster-whisper",
+    "diarised": false
+  }
   ```
+  Returned so a caller can record what produced a transcript. Without it a
+  transcript that later looks wrong cannot be traced back to its settings,
+  which makes a quality regression impossible to investigate after the fact.
 - **Cancelled response** (409) — *added 1.1.0*:
   ```json
   {"error": "transcription cancelled", "cancelled": true}
@@ -97,10 +116,23 @@ Accepts a multipart file upload and returns a plain transcript.
 
 #### `GET /health`
 
-- **Success response** (200):
+- **Success response** (200) — *`config` added 1.2.0*:
   ```json
-  {"status": "ok"}
+  {
+    "status": "ok",
+    "config": {
+      "default_model": "large-v3-turbo",
+      "backend": "faster-whisper",
+      "beam_size": null,
+      "chunk_seconds": 300,
+      "use_alignment": false,
+      "cancel_grace_seconds": 90.0
+    }
+  }
   ```
+  Static configuration only — no job state. It is reported because it was
+  otherwise invisible: nothing said which model was in use, and nothing
+  recorded it against a transcript.
 - *Since 1.1.0 this answers **during** a transcription.* Before, the pipeline
   occupied the single event loop, so the endpoint could not respond while the
   service was working — it reported unhealthy roughly 90 seconds into every

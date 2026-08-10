@@ -452,8 +452,29 @@ def _format_segments_with_speakers(segments) -> str:
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"status": "ok"}
+    """Health check, and the service's active configuration.
+
+    The configuration is here because it was otherwise invisible: nothing
+    reported which model was in use, and nothing recorded it against a
+    transcript. A report filed months ago with a mangled name offered no way
+    to tell what produced it. Hidden is inconvenient; unauditable after the
+    fact is what makes a quality regression impossible to investigate.
+
+    Static settings only — no job state. Progress belongs to
+    `/transcribe/{job_id}/status`, which is scoped to a single job and to a
+    caller that knows its identifier.
+    """
+    return {
+        "status": "ok",
+        "config": {
+            "default_model": os.environ.get("WHISPER_MODEL", "large-v3"),
+            "backend": TRANSCRIPTION_BACKEND,
+            "beam_size": TRANSCRIPTION_BEAM_SIZE,
+            "chunk_seconds": TRANSCRIPTION_CHUNK_SECONDS,
+            "use_alignment": TRANSCRIPTION_USE_ALIGNMENT,
+            "cancel_grace_seconds": CANCEL_GRACE_SECONDS,
+        },
+    }
 
 
 @app.post("/transcribe")
@@ -461,6 +482,7 @@ def transcribe(
     file: UploadFile = File(...),
     skip_diarisation: bool = Form(False),
     job_id: str | None = Form(None),
+    model: str | None = Form(None),
 ):
     """Transcribe an uploaded audio file and return plain transcript text.
 
@@ -479,6 +501,16 @@ def transcribe(
     Args:
         file: Audio file (multipart upload, field name "file")
         skip_diarisation: If true, skip speaker diarisation (faster, no HF_TOKEN needed)
+        model: Optional whisper model for this request, overriding the
+            service default. Different callers transcribe different material
+            — a dictated note read back within minutes tolerates a faster,
+            looser model; a recording that will be filed and searched for
+            years does not — and only the caller knows which it is holding.
+            Absent means the configured default.
+
+            The model must already be available to the service. A deployment
+            with no outbound network cannot fetch one on demand, so an
+            unknown name fails at load time rather than downloading.
         job_id: Optional opaque identifier chosen by the caller. When given,
             the job's progress becomes readable at
             `GET /transcribe/{job_id}/status` and it can be stopped at
@@ -514,6 +546,12 @@ def transcribe(
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
+    # Per-request model, falling back to the deployment's default. Recorded
+    # in the log and returned in the response: a transcript that later looks
+    # wrong is otherwise untraceable to what produced it, which makes a
+    # quality regression impossible to investigate months after the fact.
+    effective_model = model or os.environ.get("WHISPER_MODEL", "large-v3")
+
     workdir = None
     try:
         with _transcription_lock:
@@ -536,7 +574,7 @@ def transcribe(
                 args=(
                     tmp_path,
                     skip_diarisation,
-                    os.environ.get("WHISPER_MODEL", "large-v3"),
+                    effective_model,
                     marker_q,
                     result_q,
                     cancel_event,
@@ -555,8 +593,9 @@ def transcribe(
             with _state.lock:
                 _state.worker_pid = proc.pid
             logger.info(
-                "Worker %s started for %s (job_id=%s, skip_diarisation=%s)",
-                proc.pid, file.filename, job_id or "-", skip_diarisation,
+                "Worker %s started for %s (job_id=%s, model=%s, skip_diarisation=%s)",
+                proc.pid, file.filename, job_id or "-", effective_model,
+                skip_diarisation,
             )
 
             try:
@@ -591,12 +630,21 @@ def transcribe(
         # (fix-49 field test 2026-04-11, Bug 7 triage).
         transcript = payload["transcript"]
         logger.info(
-            "Transcribed %s: %d chars, %.1fs processing time",
+            "Transcribed %s with %s: %d chars, %.1fs processing time",
             file.filename,
+            effective_model,
             len(transcript),
             payload["elapsed_time"],
         )
-        return {"transcript": transcript}
+        return {
+            "transcript": transcript,
+            # Additive. Callers that ignore it are unaffected; callers that
+            # record it can trace a suspect transcript back to the settings
+            # that produced it.
+            "model": effective_model,
+            "backend": TRANSCRIPTION_BACKEND,
+            "diarised": not skip_diarisation,
+        }
 
     except Exception as exc:
         logger.error("Transcription failed for %s: %s", file.filename, exc, exc_info=True)
