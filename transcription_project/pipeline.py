@@ -1116,7 +1116,12 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                 "transcribe",
                 chunk_index=chunk_idx,
                 chunk_total=num_chunks,
-                audio_seconds_done=float(start_time),
+                # No position on the FIRST chunk: nothing has been decoded
+                # yet, and reporting 0.0 makes a caller render "0%" on a job
+                # that may be two-thirds finished — global diarisation having
+                # already run. Later chunks start at a genuine offset, which
+                # is real progress and worth reporting.
+                audio_seconds_done=float(start_time) if start_time > 0 else None,
                 force=True,
             )
 
