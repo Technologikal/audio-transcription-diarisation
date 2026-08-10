@@ -81,6 +81,52 @@ CANCEL_GRACE_SECONDS = float(os.environ.get("TRANSCRIPTION_CANCEL_GRACE_SECONDS"
 _PUMP_INTERVAL_SECONDS = 0.5
 
 
+def _int_env(name, default):
+    """Read an integer env var, falling back on anything unparseable."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Speed / quality settings
+# ---------------------------------------------------------------------------
+#
+# These were hard-coded. They are exposed because each trades transcript
+# quality for speed, and that trade is a deployment's to make — not this
+# file's. The defaults reproduce the previous hard-coded behaviour exactly,
+# so an existing deployment sees no change until it opts in.
+#
+# Change ONE AT A TIME and compare against a known recording. They all alter
+# the *output*, not merely how long it takes, and bundling them makes a
+# quality regression impossible to attribute.
+#
+# Note for any deployment running without internet: whichever whisper model
+# and backend you select must already be present in the image or local cache.
+# The Crucible deployment runs this container with no outbound network at
+# all, so an unbaked model fails at load time rather than downloading.
+
+# "faster-whisper" (default) or "whisperx". WhisperX runs transcription,
+# alignment and diarisation as one pipeline and needs its own wav2vec2
+# alignment model available.
+TRANSCRIPTION_BACKEND = os.environ.get("TRANSCRIPTION_BACKEND", "faster-whisper")
+
+# Whisper beam search width. Lower is faster and less accurate; 1 is greedy
+# decoding. None leaves faster-whisper's own default (5).
+TRANSCRIPTION_BEAM_SIZE = _int_env("WHISPER_BEAM_SIZE", 0) or None
+
+# Audio chunk size for the faster-whisper backend. Ignored by whisperx,
+# which chunks internally.
+TRANSCRIPTION_CHUNK_SECONDS = _int_env("TRANSCRIPTION_CHUNK_SECONDS", 300)
+
+# wav2vec2 timestamp refinement. Off by default for speed; it only affects
+# word-level timestamp precision, not the words themselves.
+TRANSCRIPTION_USE_ALIGNMENT = (
+    os.environ.get("TRANSCRIPTION_USE_ALIGNMENT", "false").lower() == "true"
+)
+
+
 class _JobState:
     """What the parent knows about the job its child is running.
 
@@ -184,9 +230,10 @@ def _worker(audio_path, skip_diarisation, whisper_model, marker_q, result_q, can
             hf_token=os.environ.get("HF_TOKEN", ""),
             whisper_model_name=whisper_model,
             language="english",
-            chunk_duration_seconds=300,  # Shorter chunks for voice notes
-            use_alignment=False,         # Skip wav2vec2 for speed
-            backend="faster-whisper",
+            chunk_duration_seconds=TRANSCRIPTION_CHUNK_SECONDS,
+            use_alignment=TRANSCRIPTION_USE_ALIGNMENT,
+            backend=TRANSCRIPTION_BACKEND,
+            beam_size=TRANSCRIPTION_BEAM_SIZE,
             skip_diarisation=skip_diarisation,
             on_marker=on_marker,
             should_cancel=should_cancel,

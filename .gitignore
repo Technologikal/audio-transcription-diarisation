@@ -5,6 +5,11 @@
 
 # Docker build cache (models copied from ~/.cache/huggingface/hub/)
 hf_cache/
+# Model weights from torchaudio's CDN (wav2vec2 alignment). Same reasoning as
+# hf_cache: multi-gigabyte binaries are a documented build input, not source.
+torch_cache/
+# NLTK tokeniser data for the whisperx backend — same reasoning again.
+nltk_data/
 
 # Python
 __pycache__/
