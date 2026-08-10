@@ -192,7 +192,7 @@ class _JobState:
 _state = _JobState()
 
 
-def _worker(audio_path, skip_diarisation, whisper_model, marker_q, result_q, cancel_event, workdir):
+def _worker(audio_path, skip_diarisation, whisper_model, speaker_hints, marker_q, result_q, cancel_event, workdir):
     """Run one transcription. Executes in the child process.
 
     Everything heavy is imported here rather than at module scope, so the
@@ -237,6 +237,7 @@ def _worker(audio_path, skip_diarisation, whisper_model, marker_q, result_q, can
             skip_diarisation=skip_diarisation,
             on_marker=on_marker,
             should_cancel=should_cancel,
+            **speaker_hints,
         )
         # Formatted in the child so only plain data crosses the process
         # boundary — SpeakerSegment objects would have to be picklable, and
@@ -483,6 +484,10 @@ def transcribe(
     skip_diarisation: bool = Form(False),
     job_id: str | None = Form(None),
     model: str | None = Form(None),
+    num_speakers: int | None = Form(None),
+    min_speakers: int | None = Form(None),
+    max_speakers: int | None = Form(None),
+    min_cluster_size: int | None = Form(None),
 ):
     """Transcribe an uploaded audio file and return plain transcript text.
 
@@ -511,6 +516,20 @@ def transcribe(
             The model must already be available to the service. A deployment
             with no outbound network cannot fetch one on demand, so an
             unknown name fails at load time rather than downloading.
+        num_speakers: Exact speaker count, when the caller knows it. Overrides
+            min/max. PyAnnote clusters to exactly this many.
+        min_speakers / max_speakers: Bounds when the exact count is unknown.
+        min_cluster_size: PyAnnote's clustering floor (its default is 12).
+            Higher merges small clusters; lower lets brief interjections
+            survive as their own speaker.
+
+            All four are optional and absent means unconstrained clustering,
+            which is what every caller got before. They matter because
+            unconstrained clustering over-segments: a real 81-minute meeting
+            with 7-8 speakers produced 15 labels, five of which held 90% of
+            the words while one held 21 words across 16 turns. Splitting one
+            person across several labels corrupts attribution in exactly the
+            output that depends on it.
         job_id: Optional opaque identifier chosen by the caller. When given,
             the job's progress becomes readable at
             `GET /transcribe/{job_id}/status` and it can be stopped at
@@ -552,6 +571,21 @@ def transcribe(
     # quality regression impossible to investigate months after the fact.
     effective_model = model or os.environ.get("WHISPER_MODEL", "large-v3")
 
+    # Only forward hints the caller actually set. Passing explicit Nones
+    # would be equivalent, but building the dict this way means the log line
+    # below shows what was requested rather than a wall of nulls — and the
+    # empty case reads unambiguously as "unconstrained, as before".
+    speaker_hints = {
+        k: v
+        for k, v in (
+            ("num_speakers", num_speakers),
+            ("min_speakers", min_speakers),
+            ("max_speakers", max_speakers),
+            ("min_cluster_size", min_cluster_size),
+        )
+        if v is not None
+    }
+
     workdir = None
     try:
         with _transcription_lock:
@@ -575,6 +609,7 @@ def transcribe(
                     tmp_path,
                     skip_diarisation,
                     effective_model,
+                    speaker_hints,
                     marker_q,
                     result_q,
                     cancel_event,
@@ -593,9 +628,10 @@ def transcribe(
             with _state.lock:
                 _state.worker_pid = proc.pid
             logger.info(
-                "Worker %s started for %s (job_id=%s, model=%s, skip_diarisation=%s)",
+                "Worker %s started for %s (job_id=%s, model=%s, "
+                "skip_diarisation=%s, hints=%s)",
                 proc.pid, file.filename, job_id or "-", effective_model,
-                skip_diarisation,
+                skip_diarisation, speaker_hints or "none",
             )
 
             try:
