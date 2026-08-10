@@ -130,6 +130,159 @@ class TranscriptionResult:
     total_duration: float = 0.0              # Audio duration in seconds
 
 
+# ---------------------------------------------------------------------------
+# Optional progress reporting and cooperative cancellation
+# ---------------------------------------------------------------------------
+#
+# Both are opt-in and transport-agnostic. The pipeline knows nothing about
+# HTTP, job identifiers, or any particular caller: it is handed two plain
+# callables and invokes them at stage boundaries. Supply neither and every
+# code path behaves exactly as it did before, so the CLI, MCP and Gradio
+# frontends are unaffected — and can adopt them later if they want to.
+
+
+class TranscriptionCancelled(Exception):
+    """Raised at a stage boundary when the cancellation predicate returns True.
+
+    A distinct type so callers can tell a deliberate stop from a failure. It
+    unwinds through the existing `finally` blocks, so temporary chunk files
+    are removed on the way out.
+    """
+
+
+class _ProgressReporter:
+    """Advances a monotonic marker and checks for cancellation.
+
+    The marker is the *only* evidence of progress a caller gets, and its
+    value is meaningless — what matters is that it changes. A caller
+    watching for a stall reads "has it moved", never "how far has it got".
+
+    Emission is rate-limited because PyAnnote's hook fires thousands of
+    times per pass, while a watchdog measured in minutes needs nothing like
+    that resolution. A step change always emits regardless of the limit, so
+    phase transitions are never swallowed.
+    """
+
+    MIN_EMIT_INTERVAL_SECONDS = 1.0
+
+    def __init__(self, on_marker=None, should_cancel=None):
+        self._on_marker = on_marker
+        self._should_cancel = should_cancel
+        self._seq = 0
+        self._last_emit = 0.0
+        self._last_phase = None
+        self.total_duration = None
+
+    @property
+    def enabled(self):
+        return self._on_marker is not None
+
+    def check_cancelled(self):
+        """Raise if the caller has asked for cancellation. Cheap; call freely."""
+        if self._should_cancel is not None and self._should_cancel():
+            raise TranscriptionCancelled("cancellation requested")
+
+    def emit(self, phase, *, chunk_index=None, chunk_total=None,
+             audio_seconds_done=None, force=False):
+        """Advance the marker and hand it to the caller.
+
+        `audio_seconds_done` is deliberately left None outside the
+        transcription phase. Global diarisation processes the whole file in
+        one pass, so there is no meaningful position within the recording
+        while it runs; reporting one would be a fabricated number, and
+        reporting zero would be worse — a caller would render it as 0%
+        progress on a job that is 61% of the way through its work.
+        """
+        self.check_cancelled()
+        if self._on_marker is None:
+            return
+
+        now = time.time()
+        phase_changed = phase != self._last_phase
+        if not (force or phase_changed) and (now - self._last_emit) < self.MIN_EMIT_INTERVAL_SECONDS:
+            return
+
+        self._seq += 1
+        self._last_emit = now
+        self._last_phase = phase
+        marker = {
+            "marker_seq": self._seq,
+            "phase": phase,
+            "chunk_index": chunk_index,
+            "chunk_total": chunk_total,
+            "audio_seconds_done": audio_seconds_done,
+            "audio_total_seconds": self.total_duration,
+        }
+        try:
+            self._on_marker(marker)
+        except Exception:
+            # A caller whose reporting breaks must not take the
+            # transcription down with it. Progress is an accessory to the
+            # job, never a precondition for it.
+            logger.debug("on_marker callback raised; ignoring", exc_info=True)
+
+
+class _PyannoteProgressHook:
+    """Bridges PyAnnote's hook protocol onto the marker reporter.
+
+    Implements the protocol rather than subclassing `ProgressHook`, whose
+    `__enter__` starts a `rich` progress bar on stdout — unwanted inside a
+    service, and it would fight the container's log stream. PyAnnote only
+    requires a callable with this signature.
+
+    This exists because global diarisation is ONE opaque pass that runs
+    before the chunk loop and accounts for ~61% of total runtime — about
+    116 minutes on a three-hour recording. Without it the marker would
+    freeze for longer than any usable stall threshold, and the watchdog
+    would cancel healthy work on every real meeting.
+    """
+
+    def __init__(self, reporter):
+        self._reporter = reporter
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def __call__(self, step_name, step_artifact, file=None, total=None, completed=None):
+        # Reported as the flat phase "diarise" rather than "diarise:<step>":
+        # the status contract fixes phase to four values, and a caller that
+        # switch-matched on it would silently stop recognising the phase the
+        # moment PyAnnote renamed an internal step. The sub-step goes to the
+        # log, where a human can use it and nothing depends on it.
+        if step_name != getattr(self, "_last_step", None):
+            self._last_step = step_name
+            logger.debug("Diarisation step: %s", step_name)
+        # Cancellation is checked inside emit(), which is what makes a long
+        # diarisation pass interruptible rather than a two-hour commitment.
+        self._reporter.emit("diarise")
+
+
+class _HookInjectingPipeline:
+    """Forwards to a PyAnnote Pipeline, adding a progress hook to each call.
+
+    Used only by the WhisperX backend, whose wrapper offers no way to pass a
+    hook through. `called` records whether the delegation actually happened,
+    so an upstream change that routes around this seam is reported rather
+    than quietly producing an uninstrumented run.
+    """
+
+    def __init__(self, inner, hook):
+        self._inner = inner
+        self._hook = hook
+        self.called = False
+
+    def __call__(self, *args, **kwargs):
+        self.called = True
+        kwargs.setdefault("hook", self._hook)
+        return self._inner(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def get_system_resources():
     """
     Check available system resources (RAM and VRAM).
@@ -304,7 +457,8 @@ def fill_none_speakers(assigned_words):
     return filled
 
 
-def assign_and_group_words(all_words, diarisation_segments, chunk_start_time, max_gap=2.0):
+def assign_and_group_words(all_words, diarisation_segments, chunk_start_time,
+                           max_gap=2.0, progress=None):
     """
     Assign Whisper words to PyAnnote speakers and group into SpeakerSegments.
 
@@ -317,6 +471,14 @@ def assign_and_group_words(all_words, diarisation_segments, chunk_start_time, ma
         diarisation_segments: List of (turn, _, speaker) tuples from PyAnnote
         chunk_start_time: Start time of this chunk in the original audio (seconds)
         max_gap: Maximum gap in seconds between words before starting a new segment
+        progress: Optional _ProgressReporter. The assignment loop below is
+            O(words x diarisation_segments) — on a long recording that is
+            every word in hours of audio scanned against every speaker turn,
+            and in global mode it runs ONCE at the end over the whole file
+            rather than per chunk. Left uninstrumented it is a silent tail:
+            the marker's last movement would be the "assemble" emit before
+            this call, and a watchdog would read the wait as a stall on work
+            that is finishing normally. Omit it and behaviour is unchanged.
 
     Returns:
         List[SpeakerSegment] with absolute timestamps
@@ -326,7 +488,16 @@ def assign_and_group_words(all_words, diarisation_segments, chunk_start_time, ma
 
     # Assign each word to a speaker
     assigned = []
-    for word in all_words:
+    for idx, word in enumerate(all_words):
+        # Checked every 500 words rather than every word: the reporter
+        # rate-limits emission anyway, and this keeps the hot loop free of a
+        # per-word call. 500 words is a few seconds of speech, so the marker
+        # still moves far more often than any threshold cares about.
+        if progress is not None and idx % 500 == 0:
+            progress.emit(
+                "assemble",
+                audio_seconds_done=chunk_start_time + word["start"],
+            )
         midpoint = (word["start"] + word["end"]) / 2
         speaker = find_speaker_at_time(
             midpoint, diarisation_segments,
@@ -525,7 +696,8 @@ def _refine_timestamps_with_wav2vec2(all_words, chunk_file, language, device):
 
 def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_seconds,
                                        whisper_model_name, language, compute_type,
-                                       initial_prompt, beam_size, diarisation_kwargs=None):
+                                       initial_prompt, beam_size, diarisation_kwargs=None,
+                                       progress=None):
     """
     Full WhisperX pipeline: transcribe + align + diarise in one pass.
 
@@ -542,11 +714,22 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
         compute_type: Compute type for the model
         initial_prompt: Initial prompt for Whisper context
         beam_size: Beam search width
+        progress: Optional _ProgressReporter. This path is instrumented
+            separately and deliberately (T014b): markers added to the
+            faster-whisper chunk loop do not exist here, so without this a
+            caller switching backend for speed would see the marker freeze
+            permanently and a stall watchdog would cancel every healthy run.
 
     Returns:
         Tuple of (speaker_segments, transcription_lines, total_duration)
+
+    Raises:
+        TranscriptionCancelled: cancellation was requested at a boundary.
     """
     import whisperx
+
+    if progress is None:
+        progress = _ProgressReporter()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -559,9 +742,12 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
     logger.info("Loading audio for WhisperX")
     audio = whisperx.load_audio(audio_path)
     total_duration = len(audio) / 16000  # WhisperX loads at 16kHz
+    progress.total_duration = total_duration
+    progress.emit("extract", force=True)
 
     # Step 1: Transcribe
     logger.info("WhisperX: Transcribing audio")
+    progress.emit("transcribe", force=True)
     transcribe_kwargs = {}
     if beam_size is not None:
         transcribe_kwargs["beam_size"] = beam_size
@@ -570,6 +756,7 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
 
     # Step 2: Align
     logger.info("WhisperX: Aligning word timestamps with wav2vec2")
+    progress.emit("transcribe", audio_seconds_done=total_duration, force=True)
     align_model, align_metadata = whisperx.load_align_model(
         language_code=detected_language, device=device
     )
@@ -582,11 +769,47 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
 
     # Step 3: Diarise
     logger.info("WhisperX: Running speaker diarisation")
-    diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
+    progress.emit("diarise", force=True)
+    # `whisperx.DiarizationPipeline` no longer exists at the package root in
+    # the installed version — it lives in whisperx.diarize. The old
+    # attribute access raised AttributeError, so this backend could not
+    # complete a run at all. Found while instrumenting it (T014b); the
+    # import is fixed here because instrumenting a path that cannot execute
+    # would be theatre.
+    from whisperx.diarize import DiarizationPipeline
+
+    diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+
+    # DiarizationPipeline.__call__ takes no hook argument, but it delegates
+    # to the PyAnnote pipeline it holds on `.model`. Wrapping that is the
+    # least invasive seam available: no DataFrame conversion is
+    # reimplemented, and if a future whisperx stops routing through it, the
+    # wrapper simply never fires and says so rather than silently producing
+    # an uninstrumented — and therefore watchdog-unsafe — diarisation.
+    hook_wrapper = None
+    if progress.enabled:
+        hook_wrapper = _HookInjectingPipeline(
+            diarize_model.model, _PyannoteProgressHook(progress)
+        )
+        diarize_model.model = hook_wrapper
+
     diarize_segments = diarize_model(audio_path, **(diarisation_kwargs or {}))
+
+    if hook_wrapper is not None and not hook_wrapper.called:
+        # FR-006a: a stage that cannot be instrumented must be reported as
+        # uninstrumented, not left silent. A frozen marker here would be
+        # read as a stall on the dominant phase of the run.
+        logger.warning(
+            "WhisperX diarisation ran WITHOUT progress instrumentation — the "
+            "marker did not advance for this stage. Stall detection is not "
+            "safe against this backend until the hook seam is restored "
+            "(FR-006a)."
+        )
+
     result = whisperx.assign_word_speakers(diarize_segments, result)
     del diarize_model
     gc.collect()
+    progress.emit("assemble", audio_seconds_done=total_duration, force=True)
 
     # Convert WhisperX output to SpeakerSegment objects
     speaker_segments = []
@@ -636,7 +859,9 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                                  min_speakers: Optional[int] = None,
                                  max_speakers: Optional[int] = None,
                                  min_cluster_size: Optional[int] = None,
-                                 diarise_per_chunk: bool = False) -> TranscriptionResult:
+                                 diarise_per_chunk: bool = False,
+                                 on_marker=None,
+                                 should_cancel=None) -> TranscriptionResult:
     """
     Transcribes an audio file with speaker diarisation, processing in chunks.
 
@@ -674,11 +899,26 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
             Lower values let short interjections survive instead of being merged.
         diarise_per_chunk: If True, run diarisation independently on each chunk (legacy
             behaviour). Default False — diarise the full file once for global clustering.
+        on_marker: Optional callable invoked at each stage boundary with a dict
+            carrying marker_seq, phase, chunk_index, chunk_total,
+            audio_seconds_done and audio_total_seconds. Transport-agnostic —
+            the pipeline neither knows nor cares what the caller does with it.
+            Omit it and nothing is reported, which is the default.
+        should_cancel: Optional callable returning True when the caller wants
+            the run to stop. Checked at the same stage boundaries; when it
+            returns True the pipeline raises TranscriptionCancelled, which
+            unwinds through the existing cleanup blocks. Omit it and the run
+            can never be interrupted, which is the default.
 
     Returns:
         TranscriptionResult with segments, lines, and optional agenda data
+
+    Raises:
+        TranscriptionCancelled: should_cancel() returned True at a boundary.
     """
     from faster_whisper import WhisperModel
+
+    progress = _ProgressReporter(on_marker=on_marker, should_cancel=should_cancel)
 
     start_time_total = time.time()
     transcription_lines = []
@@ -737,6 +977,7 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
             audio_path, hf_token, chunk_duration_seconds,
             whisper_model_name, language, compute_type,
             initial_prompt, beam_size, diarisation_kwargs,
+            progress=progress,
         )
     else:
         # Default: faster-whisper backend with manual PyAnnote diarisation
@@ -787,6 +1028,11 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
             duration_str = subprocess.check_output(probe_cmd, stderr=subprocess.PIPE).decode("utf-8").strip()
             total_duration = float(duration_str)
             logger.info(f"Audio duration: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
+            # The first marker of the run. Everything before this point is
+            # model loading and probing, which is bounded and fast; from here
+            # on the caller has evidence the job is alive.
+            progress.total_duration = total_duration
+            progress.emit("extract", force=True)
         except FileNotFoundError:
             logger.error("ffprobe not found. Please install FFmpeg.")
             raise RuntimeError("ffprobe not found. Please install FFmpeg.")
@@ -823,6 +1069,7 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
             full_ffmpeg_cmd.append(temp_full_path)
 
             logger.info("Preprocessing full audio for global diarisation")
+            progress.emit("extract", force=True)
             try:
                 subprocess.run(full_ffmpeg_cmd, check=True, capture_output=True)
             except subprocess.CalledProcessError as e:
@@ -830,8 +1077,20 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                 raise RuntimeError("ffmpeg full-file preprocess failed")
 
             logger.info("Running speaker diarisation on full file (global clustering)")
+            progress.emit("diarise", force=True)
             diar_start = time.time()
-            full_diarisation = diarisation_pipeline(temp_full_path, **diarisation_kwargs)
+            # T014a: the hook is what keeps the marker moving through this
+            # call. It is a single pass over the whole file and, measured on
+            # real audio, 61% of total runtime — ~116 minutes on a three-hour
+            # recording. Instrumenting only the chunk loop below would leave
+            # the marker frozen for the majority of a healthy run.
+            diar_hook = _PyannoteProgressHook(progress) if progress.enabled else None
+            if diar_hook is not None:
+                full_diarisation = diarisation_pipeline(
+                    temp_full_path, hook=diar_hook, **diarisation_kwargs
+                )
+            else:
+                full_diarisation = diarisation_pipeline(temp_full_path, **diarisation_kwargs)
             full_diar_segments = list(full_diarisation.itertracks(yield_label=True))
             unique_speakers = {label for _, _, label in full_diar_segments}
             logger.info(
@@ -853,6 +1112,18 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
             chunk_file = f"temp_chunk_{start_time}.wav"
 
             logger.info(f"Processing chunk {chunk_idx}/{num_chunks} ({start_time}s - {end_time}s)")
+            progress.emit(
+                "transcribe",
+                chunk_index=chunk_idx,
+                chunk_total=num_chunks,
+                # No position on the FIRST chunk: nothing has been decoded
+                # yet, and reporting 0.0 makes a caller render "0%" on a job
+                # that may be two-thirds finished — global diarisation having
+                # already run. Later chunks start at a genuine offset, which
+                # is real progress and worth reporting.
+                audio_seconds_done=float(start_time) if start_time > 0 else None,
+                force=True,
+            )
 
             # Use ffmpeg to create chunk (with optional audio preprocessing)
             ffmpeg_cmd = [
@@ -890,7 +1161,14 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                 if legacy_mode:
                     # Legacy mode: transcribe each speaker segment independently
                     logger.debug(f"Running speaker diarisation on chunk {chunk_idx} (legacy mode)")
-                    diarisation = diarisation_pipeline(chunk_file, **diarisation_kwargs)
+                    # Same hook as the global pass: per-chunk diarisation is opaque
+                    # too, and on a long chunk it is the dominant cost.
+                    _chunk_hook = _PyannoteProgressHook(progress) if progress.enabled else None
+                    diarisation = (
+                        diarisation_pipeline(chunk_file, hook=_chunk_hook, **diarisation_kwargs)
+                        if _chunk_hook is not None
+                        else diarisation_pipeline(chunk_file, **diarisation_kwargs)
+                    )
 
                     info = sf.info(chunk_file)
                     sample_rate = info.samplerate
@@ -900,6 +1178,15 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     logger.debug(f"Found {len(segments)} speaker segments in chunk {chunk_idx}")
 
                     for seg_idx, (turn, _, speaker) in enumerate(segments, 1):
+                        # Legacy mode transcribes each speaker turn
+                        # separately, so this loop — not the chunk loop — is
+                        # where a long recording actually spends its time.
+                        progress.emit(
+                            "transcribe",
+                            chunk_index=chunk_idx,
+                            chunk_total=num_chunks,
+                            audio_seconds_done=float(start_time) + float(turn.start),
+                        )
                         start_frame = int(turn.start * sample_rate)
                         end_frame = int(turn.end * sample_rate)
                         segment_audio_data = chunk_audio[start_frame:end_frame].astype(np.float32)
@@ -996,6 +1283,18 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     # for compatibility with assign_and_group_words)
                     all_words = []
                     for segment in segments_gen:
+                        # faster-whisper decodes lazily, so the real work of a
+                        # chunk happens during this iteration rather than in
+                        # the call above. Emitting here — rate-limited to 1/s
+                        # inside the reporter — keeps the marker moving through
+                        # a long chunk, and is also where a cancellation
+                        # request takes effect mid-chunk.
+                        progress.emit(
+                            "transcribe",
+                            chunk_index=chunk_idx,
+                            chunk_total=num_chunks,
+                            audio_seconds_done=float(start_time) + float(segment.end or 0.0),
+                        )
                         # #93: skip subtitle-credit hallucination segments entirely.
                         if is_subtitle_credit_hallucination(segment.text):
                             logger.warning(
@@ -1016,6 +1315,13 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     # Optional: refine timestamps with wav2vec2 alignment
                     if use_alignment and all_words and not skip_diarisation:
                         logger.debug(f"Refining timestamps with wav2vec2 alignment for chunk {chunk_idx}")
+                        progress.emit(
+                            "transcribe",
+                            chunk_index=chunk_idx,
+                            chunk_total=num_chunks,
+                            audio_seconds_done=float(end_time),
+                            force=True,
+                        )
                         all_words = _refine_timestamps_with_wav2vec2(
                             all_words, chunk_file, language, device
                         )
@@ -1054,14 +1360,22 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                     else:
                         # Per-chunk diarisation (--diarise-per-chunk path)
                         logger.debug(f"Running speaker diarisation on chunk {chunk_idx}")
-                        diarisation = diarisation_pipeline(chunk_file, **diarisation_kwargs)
+                        # Same hook as the global pass: per-chunk diarisation is opaque
+                        # too, and on a long chunk it is the dominant cost.
+                        _chunk_hook = _PyannoteProgressHook(progress) if progress.enabled else None
+                        diarisation = (
+                            diarisation_pipeline(chunk_file, hook=_chunk_hook, **diarisation_kwargs)
+                            if _chunk_hook is not None
+                            else diarisation_pipeline(chunk_file, **diarisation_kwargs)
+                        )
 
                         diar_segments = list(diarisation.itertracks(yield_label=True))
                         logger.debug(f"Found {len(diar_segments)} diarisation segments in chunk {chunk_idx}")
 
                         if all_words and diar_segments:
                             chunk_speaker_segments = assign_and_group_words(
-                                all_words, diar_segments, start_time, max_gap=2.0
+                                all_words, diar_segments, start_time, max_gap=2.0,
+                                progress=progress,
                             )
                         elif all_words:
                             text = "".join(w["word"] for w in all_words).strip()
@@ -1088,14 +1402,20 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
 
         # Post-loop: assign accumulated global words to global diarisation segments.
         if global_diarisation:
+            progress.emit("assemble", audio_seconds_done=total_duration, force=True)
             try:
                 if global_words and full_diar_segments:
                     logger.info(
                         f"Aligning {len(global_words)} words to "
                         f"{len(full_diar_segments)} global diarisation segments"
                     )
+                    # The global case is the one that matters: this runs ONCE
+                    # over every word in the whole recording, after the chunk
+                    # loop has finished, so nothing else is emitting markers
+                    # while it works.
                     final_segments = assign_and_group_words(
-                        global_words, full_diar_segments, 0, max_gap=2.0
+                        global_words, full_diar_segments, 0, max_gap=2.0,
+                        progress=progress,
                     )
                 elif global_words:
                     text = "".join(w["word"] for w in global_words).strip()

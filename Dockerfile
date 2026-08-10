@@ -38,6 +38,23 @@ COPY hf_cache/models--pyannote--segmentation-3.0 /root/.cache/huggingface/hub/mo
 COPY hf_cache/models--pyannote--speaker-diarization-3.1 /root/.cache/huggingface/hub/models--pyannote--speaker-diarization-3.1
 COPY hf_cache/models--pyannote--wespeaker-voxceleb-resnet34-LM /root/.cache/huggingface/hub/models--pyannote--wespeaker-voxceleb-resnet34-LM
 
+# Optional faster model, selected with WHISPER_MODEL=large-v3-turbo. Baked
+# rather than downloaded because a deployment may run this container with no
+# outbound network at all, in which case an unbaked model is not a slow start
+# — it is a hard failure at load time.
+COPY hf_cache/models--mobiuslabsgmbh--faster-whisper-large-v3-turbo /root/.cache/huggingface/hub/models--mobiuslabsgmbh--faster-whisper-large-v3-turbo
+
+# wav2vec2 alignment weights, for TRANSCRIPTION_BACKEND=whisperx and for
+# TRANSCRIPTION_USE_ALIGNMENT=true. These come from torchaudio's own CDN
+# rather than HuggingFace, so they need their own cache location and
+# TORCH_HOME below to point at it.
+COPY torch_cache/hub/checkpoints /root/.cache/torch/hub/checkpoints
+
+# NLTK tokeniser data, required by the whisperx backend's alignment step.
+# whisperx calls nltk.download() at runtime; on a network-isolated
+# deployment that fails and takes the whole transcription with it.
+COPY nltk_data /usr/local/share/nltk_data
+
 # Copy application source
 COPY transcription_project/ /app/
 
@@ -48,6 +65,11 @@ COPY read_secret.py /app/read_secret.py
 
 # Default to HTTP mode (Zone 3 pre-processing for voice notes)
 ENV SERVER_MODE=http
+
+# Where torchaudio looks for the alignment weights baked in above. Without
+# this it defaults elsewhere and tries to download — which fails closed on a
+# network-isolated deployment.
+ENV TORCH_HOME=/root/.cache/torch
 
 EXPOSE 8001
 
