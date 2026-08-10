@@ -1,6 +1,6 @@
 # Integration Contract: audio-transcription-diarisation
 
-**Version**: 1.2.0
+**Version**: 1.3.0
 **Last updated**: 2026-08-10
 
 This document declares the stable interfaces that Crucible depends on.
@@ -35,6 +35,27 @@ Accepts a multipart file upload and returns a plain transcript.
   The model must already be available to the service. A deployment with no
   outbound network cannot fetch one on demand, so an unknown name fails at
   load time rather than downloading.
+- **Optional fields**: `num_speakers`, `min_speakers`, `max_speakers`,
+  `min_cluster_size` (integers) — *added 1.3.0.* Clustering hints passed
+  straight to PyAnnote. All optional; absent means unconstrained clustering,
+  which is what every caller got before.
+
+  They exist because unconstrained clustering **over-segments**. A real
+  81-minute meeting with 7–8 speakers came back with **15 labels** — five
+  holding 90% of the words, one holding 21 words across 16 turns. One person
+  split across several labels corrupts attribution in exactly the output that
+  depends on it.
+
+  `num_speakers` forces an exact count and overrides the bounds.
+  `min_cluster_size` is PyAnnote's clustering floor (its default is 12):
+  higher merges small clusters, lower lets brief interjections survive as
+  their own speaker.
+
+  > A caller that knows only a rough figure should send `max_speakers`, not
+  > `num_speakers`. Say six people are expected and only five speak:
+  > `max_speakers=6` yields five, while `num_speakers=6` forces a sixth into
+  > existence. Capping too low fuses real speakers together and does it
+  > silently, so the softer bound is the safer default.
 - **Success response** (200) — *`model`, `backend` and `diarised` added
   1.2.0; purely additive, existing callers can ignore them*:
   ```json
