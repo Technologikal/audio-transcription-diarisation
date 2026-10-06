@@ -49,6 +49,7 @@ from pyannote.audio import Pipeline
 import os
 import soundfile as sf
 import numpy as np
+import re
 import subprocess
 import math
 import logging
@@ -839,6 +840,69 @@ def _transcribe_with_whisperx_backend(audio_path, hf_token, chunk_duration_secon
     return speaker_segments, transcription_lines, total_duration
 
 
+_ESTIMATED_DURATION_WARNING = "Estimating duration from bitrate"
+
+
+def probe_audio_duration(audio_path):
+    """Real duration of `audio_path` in seconds.
+
+    ffprobe's `format=duration` is exact for container formats (m4a, mp3
+    with a Xing header, wav), but for a raw ADTS `.aac` stream — which is how
+    Signal stores EVERY voice note — it is an estimate from the bitrate, and
+    ffprobe says so on stderr. Voice notes are variable-bitrate, so the
+    estimate runs short: 214.1s for a note that is really 231.5s. The chunk
+    loop cut audio at that figure, so every voice note lost its last ~5-8% —
+    the sign-off, which is where departure phrases and final details live
+    (found 2026-10-06; 25 of 25 recent notes affected).
+
+    When ffprobe warns that it is estimating, decode the whole file and take
+    the position of the last decoded frame. Decoding is fast (well under a
+    second for a voice note) and only paid when the header cannot be trusted.
+
+    Raises RuntimeError if neither method yields a duration.
+    """
+    probe = subprocess.run(
+        ["ffprobe", "-v", "warning", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        raise subprocess.CalledProcessError(
+            probe.returncode, probe.args, probe.stdout, probe.stderr
+        )
+    header = probe.stdout.decode("utf-8").strip()
+    warnings = probe.stderr.decode("utf-8", "replace")
+
+    if _ESTIMATED_DURATION_WARNING not in warnings:
+        return float(header)
+
+    decoded = decoded_audio_duration(audio_path)
+    logger.info(
+        f"Duration header is a bitrate estimate ({header}s); "
+        f"decoded length is {decoded:.2f}s"
+    )
+    return decoded
+
+
+def decoded_audio_duration(audio_path):
+    """Duration by decoding every frame — exact, whatever the header says."""
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", audio_path,
+         "-map", "0:a:0", "-f", "null", "-"],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, result.stdout, result.stderr
+        )
+    # ffmpeg reports progress as time=HH:MM:SS.xx; the final one is the end.
+    matches = re.findall(rb"time=(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    if not matches:
+        raise ValueError(f"Could not measure decoded duration of {audio_path}")
+    h, m, sec = matches[-1]
+    return int(h) * 3600 + int(m) * 60 + float(sec)
+
+
 def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600,
                                  whisper_model_name="medium", language="english",
                                  agenda_path: Optional[str] = None,
@@ -1016,17 +1080,10 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                 diarisation_pipeline.to(torch.device("cuda"))
                 logger.info("Using GPU acceleration (CUDA)")
 
-        # Get audio duration using ffprobe
-        probe_cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            audio_path
-        ]
+        # Get audio duration — see probe_audio_duration for why this is not a
+        # bare ffprobe call any more.
         try:
-            duration_str = subprocess.check_output(probe_cmd, stderr=subprocess.PIPE).decode("utf-8").strip()
-            total_duration = float(duration_str)
+            total_duration = probe_audio_duration(audio_path)
             logger.info(f"Audio duration: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
             # The first marker of the run. Everything before this point is
             # model loading and probing, which is bounded and fast; from here
@@ -1109,6 +1166,11 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
 
         for chunk_idx, start_time in enumerate(range(0, math.ceil(total_duration), chunk_duration_seconds), 1):
             end_time = min(start_time + chunk_duration_seconds, total_duration)
+            # The LAST chunk runs to the end of the file, not to end_time.
+            # end_time comes from a measured duration, and a duration that is
+            # wrong by even a second must never be able to drop audio again
+            # (2026-10-06: every Signal voice note lost its last ~7%).
+            is_last_chunk = chunk_idx == num_chunks
             chunk_file = f"temp_chunk_{start_time}.wav"
 
             logger.info(f"Processing chunk {chunk_idx}/{num_chunks} ({start_time}s - {end_time}s)")
@@ -1131,7 +1193,7 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                 "-y",  # Overwrite output file if it exists
                 "-i", audio_path,
                 "-ss", str(start_time),
-                "-to", str(end_time),
+                *([] if is_last_chunk else ["-to", str(end_time)]),
                 "-ac", "1",
                 "-ar", "16000",
             ]

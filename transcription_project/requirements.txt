@@ -1,4 +1,9 @@
 faster-whisper>=1.0.0
+# Pinned below 18 (2026-10-06): a rebuild pulled av 19, which removed the
+# `metadata_errors` argument faster-whisper 1.2.1 passes to av.open(), and
+# every transcription failed with "open() got an unexpected keyword argument
+# 'metadata_errors'". 17.0.0 is the version the working image ran on.
+av>=11,<18
 whisperx>=3.0.0
 pyannote.audio>=3.1,<4.0
 torch
