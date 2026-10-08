@@ -478,6 +478,10 @@ async def health():
     }
 
 
+def _default_vad_filter() -> bool:
+    return os.environ.get("TRANSCRIPTION_VAD_FILTER", "true").strip().lower() not in ("0", "false", "no")
+
+
 @app.post("/transcribe")
 def transcribe(
     file: UploadFile = File(...),
@@ -488,6 +492,7 @@ def transcribe(
     min_speakers: int | None = Form(None),
     max_speakers: int | None = Form(None),
     min_cluster_size: int | None = Form(None),
+    vad_filter: bool | None = Form(None),
 ):
     """Transcribe an uploaded audio file and return plain transcript text.
 
@@ -582,6 +587,10 @@ def transcribe(
             ("min_speakers", min_speakers),
             ("max_speakers", max_speakers),
             ("min_cluster_size", min_cluster_size),
+            # #93 (2026-10-08): per request — off for uploaded recordings,
+            # where it drops quiet real speech. Unset → TRANSCRIPTION_VAD_FILTER
+            # (default on), so existing callers are unchanged.
+            ("vad_filter", vad_filter if vad_filter is not None else _default_vad_filter()),
         )
         if v is not None
     }
