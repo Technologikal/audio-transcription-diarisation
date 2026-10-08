@@ -923,6 +923,7 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                                  min_speakers: Optional[int] = None,
                                  max_speakers: Optional[int] = None,
                                  min_cluster_size: Optional[int] = None,
+                                 vad_filter: bool = True,
                                  diarise_per_chunk: bool = False,
                                  on_marker=None,
                                  should_cancel=None) -> TranscriptionResult:
@@ -960,6 +961,14 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
         min_speakers: Lower bound for speaker count.
         max_speakers: Upper bound for speaker count.
         min_cluster_size: Override PyAnnote's clustering min_cluster_size (default 12).
+        vad_filter: Drop non-speech before decoding (default True). Measured
+            2026-10-08 (#93): on quieter recordings — dictation with the phone
+            away from the speaker, softer voices in a meeting — the VAD
+            classifies real speech as silence: 45% of the words of one
+            12-minute recording, 0.4–4.8% of meetings, ~0% of close-mic voice
+            notes. Hallucination is held off by condition_on_previous_text=False
+            and the subtitle-credit filter, not by VAD (25 recordings, VAD off,
+            no hallucination). So callers turn it off for uploaded recordings.
             Lower values let short interjections survive instead of being merged.
         diarise_per_chunk: If True, run diarisation independently on each chunk (legacy
             behaviour). Default False — diarise the full file once for global clustering.
@@ -1266,7 +1275,7 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                             #  - vad_filter=True drops silence before decoding,
                             #    removing the conditions that trigger it at all.
                             "condition_on_previous_text": False,
-                            "vad_filter": True,
+                            "vad_filter": vad_filter,
                         }
                         if language:
                             transcribe_kwargs["language"] = language
@@ -1319,7 +1328,7 @@ def transcribe_with_diarisation(audio_path, hf_token, chunk_duration_seconds=600
                         # condition_on_previous_text=False, and the silent-prefix
                         # attack surface removed by vad_filter=True.
                         "condition_on_previous_text": False,
-                        "vad_filter": True,
+                        "vad_filter": vad_filter,
                     }
                     if language:
                         transcribe_kwargs["language"] = language
